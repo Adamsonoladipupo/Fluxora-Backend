@@ -1,6 +1,8 @@
 import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
 import { getCorrelationId } from '../tracing/middleware.js';
+
 import { logger } from '../lib/logger.js';
+
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { computeWebhookSignature } from './signature.js';
@@ -372,20 +374,33 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
   const payloadStr = JSON.stringify(opts.payload);
   const signature = computeWebhookSignature(opts.secret, timestamp, payloadStr);
 
+  // Propagate correlation ID when available to preserve end-to-end tracing.
+  // Header name uses the shared correlation constant to avoid mismatches.
+  const effectiveCorrelationId = getCorrelationId();
+
   // Add AbortController timeout to prevent slow-loris attacks
+
   const controller = new AbortController();
   const timeoutMs = DEFAULT_RETRY_POLICY.timeoutMs;
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Fluxora-Event': opts.event,
+      'X-Fluxora-Signature': signature,
+      'X-Fluxora-Timestamp': timestamp,
+    };
+
+    // Only propagate the correlation ID; it is validated as a UUID-shaped value
+    // by the correlationId middleware.
+    if (effectiveCorrelationId && effectiveCorrelationId !== 'unknown') {
+      headers[CORRELATION_ID_HEADER] = effectiveCorrelationId;
+    }
+
     await fetch(validatedUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Fluxora-Event': opts.event,
-        'X-Fluxora-Signature': signature,
-        'X-Fluxora-Timestamp': timestamp,
-      },
+      headers,
       body: payloadStr,
       signal: controller.signal,
     });

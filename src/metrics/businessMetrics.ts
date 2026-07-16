@@ -157,6 +157,23 @@ export const sseEventListenersGauge =
   });
 
 /**
+ * Counter for exceptions thrown by live SSE subscriber callbacks.
+ *
+ * @security
+ * - No SSE payloads, user data, or correlation IDs are included in the labels.
+ * - Label set is bounded via `reason` enum to avoid cardinality blowup.
+ */
+export const sseSubscriberErrorsTotal =
+  (registry.getSingleMetric('fluxora_sse_subscriber_errors_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_sse_subscriber_errors_total',
+    help: 'Total number of errors thrown by live SSE subscriber callbacks',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+
+/**
  * Webhook outbox backlog gauge.
  *
  * Tracks the number of webhook deliveries pending in the outbox (waiting to be sent or retried).
@@ -253,6 +270,8 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');
   registry.removeSingleMetric('fluxora_sse_live_subscribers');
   registry.removeSingleMetric('fluxora_sse_event_listeners');
+  registry.removeSingleMetric('fluxora_sse_subscriber_errors_total');
   registry.removeSingleMetric('fluxora_ws_auth_failure_total');
   registry.removeSingleMetric('fluxora_admin_reindex_job_duration_seconds');
 }
+

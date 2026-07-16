@@ -1,9 +1,16 @@
 import { EventEmitter } from 'node:events';
+
+
+
+
 import type { StreamEventRecord } from '../db/types.js';
 import {
   sseLiveSubscribersGauge,
   sseEventListenersGauge,
+  sseSubscriberErrorsTotal,
 } from '../metrics/businessMetrics.js';
+import { logger } from '../logging/logger.js';
+
 import { logger } from '../lib/logger.js';
 
 export const SSE_STREAM_UPDATE_EVENT = 'stream_update';
@@ -73,11 +80,26 @@ function dispatchLiveSseEvent(event: LiveSseStreamUpdateEvent): void {
   for (const subscriber of Array.from(subscribers)) {
     try {
       subscriber(event);
-    } catch {
+    } catch (err) {
       // Isolate one failing connection from the rest of the stream fan-out.
+      // Observability: meter + structured log so persistent listeners are visible.
+      sseSubscriberErrorsTotal.inc({ reason: 'subscriber_callback_throw' });
+
+      const error = err instanceof Error ? err : new Error(String(err));
+
+      // Security: do not log SSE payload. Only log streamId + error identity.
+      logger.error('SSE subscriber callback threw', {
+        streamId: event.streamId,
+        subscriberError: {
+          name: error.name,
+          message: error.message,
+        },
+      });
+
     }
   }
 }
+
 
 function isDispatchAttached(): boolean {
   return sseEventBus.listeners(SSE_STREAM_UPDATE_EVENT).includes(dispatchLiveSseEvent);

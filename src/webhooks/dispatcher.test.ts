@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { logger } from '../lib/logger.js';
-import { WebhookDispatcher, type WebhookDispatchOptions } from './dispatcher.js';
+import { WebhookDispatcher, dispatchWebhook, type WebhookDispatchOptions } from './dispatcher.js';
+import { correlationStore } from '../tracing/middleware.js';
+import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
+
 import { DEFAULT_RETRY_POLICY } from './types.js';
 
 const originalFetch = global.fetch;
@@ -38,7 +41,45 @@ function expectNoSensitiveLogData(
   }
 }
 
-describe('Webhook Dispatcher', () => {
+describe('Webhook Dispatcher (legacy + enhanced)', () => {
+  it('forwards correlation id header on legacy dispatchWebhook path', async () => {
+    let captured: RequestInit | undefined;
+    global.fetch = (async (_url: string, options?: RequestInit) => {
+      captured = options;
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await correlationStore.run('legacy-corr-123', async () => {
+      await dispatchWebhook({
+        url: 'https://example.com/webhook',
+        secret: 'secret',
+        event: 'stream.created',
+        payload: { foo: 'bar' },
+      });
+    });
+
+    const headers = captured?.headers as Record<string, string>;
+    expect(headers[CORRELATION_ID_HEADER]).toBe('legacy-corr-123');
+  });
+
+  it('omits correlation id header on legacy dispatchWebhook when no context exists', async () => {
+    let captured: RequestInit | undefined;
+    global.fetch = (async (_url: string, options?: RequestInit) => {
+      captured = options;
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await dispatchWebhook({
+      url: 'https://example.com/webhook',
+      secret: 'secret',
+      event: 'stream.created',
+      payload: { foo: 'bar' },
+    });
+
+    const headers = captured?.headers as Record<string, string>;
+    expect(headers[CORRELATION_ID_HEADER]).toBeUndefined();
+  });
+
   afterEach(() => {
     global.fetch = originalFetch;
     vi.restoreAllMocks();

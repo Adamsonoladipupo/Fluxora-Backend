@@ -60,51 +60,13 @@ histogram_quantile(0.99, rate(fluxora_db_query_duration_seconds_bucket[5m]))
 
 Every PostgreSQL query is timed. When duration ≥ `SLOW_QUERY_THRESHOLD_MS`, a structured OCSF log entry is emitted and a Prometheus counter is incremented.
 
-### Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SLOW_QUERY_THRESHOLD_MS` | `1000` | Threshold in ms. Set to `0` to disable. |
-
-### OCSF Log Format
-
-Entries follow [OCSF Database Activity](https://schema.ocsf.io/classes/database_activity) (class_uid 5001), compatible with Splunk, Datadog, and Elastic.
-
-```json
-{
-  "timestamp": "2026-05-29T16:00:00.000Z",
-  "level": "warn",
-  "message": "Slow postgres query",
-  "context": {
-    "query_hash": "a3f1c2d4e5b6a7f8",
-    "duration_ms": 1234,
-    "table_hint": "streams",
-    "correlation_id": "req_abc123"
-  }
-}
-```
-
-| Field | Description |
-|-------|-------------|
-| `log_type` | Always `slow_query` — use for SIEM filter rules |
-| `class_uid` | OCSF class: 5001 (Database Activity) |
-| `activity_id` | OCSF activity: 1 (Query) |
-| `severity_id` | OCSF severity: 3 (Medium) |
-| `severity` | Human-readable severity |
-| `time` | ISO-8601 timestamp |
-| `query_hash` | First 16 hex chars of SHA-256(sql). Stable; safe to log. |
-| `duration_ms` | Wall-clock query duration in milliseconds |
-| `table_hint` | First table name extracted from SQL keywords |
-| `correlation_id` | Request correlation ID, if available |
-
-Raw SQL and parameter values are **never** logged.
-
 ### Prometheus Counter
 
 ```
 fluxora_db_slow_queries_total{table_hint="streams"} 3
 ```
 
+## Server-Sent Events (SSE) observability
 Counter name: `fluxora_db_slow_queries_total`  
 Label: `table_hint` — the extracted table name (or `unknown`).  
 Scraped at: `GET /metrics`
@@ -273,63 +235,22 @@ Range rationale:
 
 The label set is intentionally restricted to a single `outcome` label. The metrics must **never** carry credential material. The following labels are forbidden both now and in future iterations:
 
-- `jti`, `kid`, `sub`, `subject`
-- `keyId`, `prefix`, `keyHash`, raw-key substrings
-- `address` / account ids derived from the token
-- `userId` / `principalId`
+### Subscriber callback errors
 
-Tests in `tests/metrics/businessMetrics.test.ts` explicitly assert the label set is `{ outcome: 'success' }` or `{ outcome: 'failure' }` only.
+When a live SSE subscriber callback throws, Fluxora keeps fan-out isolated (other subscribers still run) but emits both:
 
-### PromQL examples
+1. a structured error log
+2. a Prometheus counter
 
-**p99 JWT verify latency**
+**Metric**
 
-```promql
-histogram_quantile(
-  0.99,
-  rate(fluxora_auth_jwt_verify_duration_seconds_bucket[5m])
-)
-```
+- Name: `fluxora_sse_subscriber_errors_total`
+- Type: Counter
+- Label: `reason` (bounded enum)
 
-**p99 API-key lookup latency**
+This metric increments on thrown subscriber callbacks.
 
-```promql
-histogram_quantile(
-  0.99,
-  rate(fluxora_auth_apikey_lookup_duration_seconds_bucket[5m])
-)
-```
+**Security**
 
-**Auth failure rate (any path) per second**
+SSE payloads and other stream-level data are not included in the log/metric labels (only `streamId` is logged; the payload is not logged).
 
-```promql
-sum(rate(
-  fluxora_auth_jwt_verify_duration_seconds_count{outcome="failure"}[5m]
-))
-+
-sum(rate(
-  fluxora_auth_apikey_lookup_duration_seconds_count{outcome="failure"}[5m]
-))
-```
-
-**Alert: JWT verify p99 > 250 ms for 5 minutes**
-
-```promql
-histogram_quantile(
-  0.99,
-  rate(fluxora_auth_jwt_verify_duration_seconds_bucket[5m])
-) > 0.25
-```
-
-### Thresholding strategy
-
-- **Latency p99 > 250 ms (JWT)**: indicates the revocation-store lookup is slow or the cryptographic step is being starved; pair with `redis_pending_commands` and CPU pressure signals.
-- **Latency p99 > 20 ms (API key, in-memory)**: useful as a canary when a DB-backed store is introduced, since lookups should remain single-digit milliseconds.
-- **Failure rate sustained > 5%**: indicates a misconfiguration in token issuance, key rotation, or upstream auth provider outage.
-
-### Affected source files
-
-- `src/metrics/businessMetrics.ts` — histogram definitions
-- `src/middleware/auth.ts` — JWT verify timer
-- `src/lib/apiKey.ts` — `isValidApiKey` timer
-- `src/middleware/adminAuth.ts` — admin env-var key check timer

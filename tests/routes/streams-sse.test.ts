@@ -20,7 +20,12 @@ import {
   _resetSseConnectionLimiter,
   getActiveSseConnectionCount,
 } from '../../src/streams/sseConnectionLimiter.js';
-import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal } from '../../src/metrics/businessMetrics.js';
+import {
+  sseActiveConnectionsGauge,
+  sseConnectionsRejectedTotal,
+  sseSubscriberErrorsTotal,
+} from '../../src/metrics/businessMetrics.js';
+
 import { StaleCursorError } from '../../src/indexer/store.js';
 
 // ── Mock the repository and Redis before importing the app ──────────────────────────────
@@ -157,6 +162,7 @@ function makeDbRecord(overrides: Record<string, unknown> = {}) {
 }
 
 describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
+
   let server: ReturnType<typeof createServer>;
   let port: number;
 
@@ -461,6 +467,7 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
 
   it('streams live events via sseEventBus', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
 
     const resPromise = new Promise<string>((resolve) => {
       const req = http.get(`http://127.0.0.1:${port}/api/streams/stream-123/events`, (res) => {
