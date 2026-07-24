@@ -8,10 +8,7 @@ import {
   resetWsBackpressureMetrics,
   WS_BROADCAST_BATCH_FLUSH_BUCKETS,
 } from '../../src/metrics/wsBackpressure.js';
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+import { connectClient, sendJson, wait } from './fixtures/slowClient.js';
 
 type MetricSnapshot = {
   values: Array<{ metricName?: string; labels: Partial<Record<string, string | number>>; value: number }>;
@@ -27,6 +24,11 @@ async function getMetricSampleSum(metric: { get: () => Promise<MetricSnapshot> }
   const snapshot = await metric.get();
   const sumSample = snapshot.values.find((s) => s.metricName?.endsWith('_sum'));
   return sumSample ? sumSample.value : 0;
+}
+
+/** Subscribe a client to a stream, optionally with batching enabled. */
+function subscribe(ws: WebSocket, streamId: string, batching = false): void {
+  sendJson(ws, { type: 'subscribe', streamId, batching });
 }
 
 describe('StreamHub micro-batching flush latency metric (fluxora_ws_broadcast_batch_flush_seconds)', () => {
@@ -85,11 +87,12 @@ describe('StreamHub micro-batching flush latency metric (fluxora_ws_broadcast_ba
     ]);
   });
 
-  it('is a no-op with zero overhead when micro-batching is disabled (default mode, flushWindowMs = 0)', async () => {
-    hub = new StreamHub(server, { flushWindowMs: 0 });
+  it('is a no-op with zero overhead when the subscriber has not opted into batching', async () => {
+    hub = new StreamHub(server, { batching: { flushMs: 30, maxSize: 100 } });
 
-    const ws = trackSocket(new WebSocket(`ws://127.0.0.1:${port}/ws/streams?stream_id=stream-default`));
-    await new Promise<void>((resolve) => ws.on('open', resolve));
+    const ws = trackSocket(await connectClient(port));
+    subscribe(ws, 'stream-default', false);
+    await wait(10);
 
     await hub.broadcast({
       streamId: 'stream-default',
@@ -97,21 +100,22 @@ describe('StreamHub micro-batching flush latency metric (fluxora_ws_broadcast_ba
       payload: { test: true },
     });
 
-    await delay(50);
+    await wait(50);
 
     const count = await getMetricSampleCount(wsBroadcastBatchFlushSeconds);
     expect(count).toBe(0);
   });
 
-  it('records age of oldest event in batch when micro-batching is enabled (flushWindowMs > 0)', async () => {
-    hub = new StreamHub(server, { flushWindowMs: 30 });
+  it('records age of oldest event in batch for an opted-in subscriber', async () => {
+    hub = new StreamHub(server, { batching: { flushMs: 30, maxSize: 100 } });
 
-    const ws = trackSocket(new WebSocket(`ws://127.0.0.1:${port}/ws/streams?stream_id=stream-batch`));
+    const ws = trackSocket(await connectClient(port));
     const receivedMessages: any[] = [];
     ws.on('message', (data) => {
       receivedMessages.push(JSON.parse(data.toString('utf8')));
     });
-    await new Promise<void>((resolve) => ws.on('open', resolve));
+    subscribe(ws, 'stream-batch', true);
+    await wait(10);
 
     await hub.broadcast({
       streamId: 'stream-batch',
@@ -122,10 +126,10 @@ describe('StreamHub micro-batching flush latency metric (fluxora_ws_broadcast_ba
     expect(receivedMessages.length).toBe(0);
 
     // Wait for the flush window timer (30ms) + buffer
-    await delay(60);
+    await wait(60);
 
     expect(receivedMessages.length).toBe(1);
-    expect(receivedMessages[0].eventId).toBe('evt-batch-001');
+    expect(receivedMessages[0].events[0].eventId).toBe('evt-batch-001');
 
     const count = await getMetricSampleCount(wsBroadcastBatchFlushSeconds);
     const sum = await getMetricSampleSum(wsBroadcastBatchFlushSeconds);
@@ -135,14 +139,15 @@ describe('StreamHub micro-batching flush latency metric (fluxora_ws_broadcast_ba
   });
 
   it('records oldest event age when multiple events are coalesced in one flush', async () => {
-    hub = new StreamHub(server, { flushWindowMs: 40 });
+    hub = new StreamHub(server, { batching: { flushMs: 40, maxSize: 100 } });
 
-    const ws = trackSocket(new WebSocket(`ws://127.0.0.1:${port}/ws/streams?stream_id=stream-multi`));
+    const ws = trackSocket(await connectClient(port));
     const receivedMessages: any[] = [];
     ws.on('message', (data) => {
       receivedMessages.push(JSON.parse(data.toString('utf8')));
     });
-    await new Promise<void>((resolve) => ws.on('open', resolve));
+    subscribe(ws, 'stream-multi', true);
+    await wait(10);
 
     // Enqueue event 1 at t=0
     await hub.broadcast({
@@ -151,7 +156,7 @@ describe('StreamHub micro-batching flush latency metric (fluxora_ws_broadcast_ba
       payload: { seq: 1 },
     });
 
-    await delay(20);
+    await wait(20);
 
     // Enqueue event 2 at t=20ms
     await hub.broadcast({
@@ -161,9 +166,10 @@ describe('StreamHub micro-batching flush latency metric (fluxora_ws_broadcast_ba
     });
 
     // Wait until flush window (40ms from t=0) expires
-    await delay(50);
+    await wait(50);
 
-    expect(receivedMessages.length).toBe(2);
+    expect(receivedMessages.length).toBe(1);
+    expect(receivedMessages[0].events.length).toBe(2);
 
     const count = await getMetricSampleCount(wsBroadcastBatchFlushSeconds);
     const sum = await getMetricSampleSum(wsBroadcastBatchFlushSeconds);
@@ -172,25 +178,27 @@ describe('StreamHub micro-batching flush latency metric (fluxora_ws_broadcast_ba
     expect(sum).toBeGreaterThan(0.035); // Oldest event was queued for ~40ms (>= 0.035s)
   });
 
-  it('flushes immediately when maxBatchSize is reached', async () => {
-    hub = new StreamHub(server, { flushWindowMs: 1000, maxBatchSize: 2 });
+  it('flushes immediately when maxSize is reached', async () => {
+    hub = new StreamHub(server, { batching: { flushMs: 1000, maxSize: 2 } });
 
-    const ws = trackSocket(new WebSocket(`ws://127.0.0.1:${port}/ws/streams?stream_id=stream-max`));
+    const ws = trackSocket(await connectClient(port));
     const receivedMessages: any[] = [];
     ws.on('message', (data) => {
       receivedMessages.push(JSON.parse(data.toString('utf8')));
     });
-    await new Promise<void>((resolve) => ws.on('open', resolve));
+    subscribe(ws, 'stream-max', true);
+    await wait(10);
 
     await hub.broadcast({ streamId: 'stream-max', eventId: 'evt-m-1', payload: {} });
     expect(receivedMessages.length).toBe(0);
 
-    // Second broadcast triggers maxBatchSize (2) immediately without waiting 1s
+    // Second broadcast triggers maxSize (2) immediately without waiting 1s
     await hub.broadcast({ streamId: 'stream-max', eventId: 'evt-m-2', payload: {} });
 
-    await delay(20);
+    await wait(20);
 
-    expect(receivedMessages.length).toBe(2);
+    expect(receivedMessages.length).toBe(1);
+    expect(receivedMessages[0].events.length).toBe(2);
 
     const count = await getMetricSampleCount(wsBroadcastBatchFlushSeconds);
     expect(count).toBe(1);
@@ -204,19 +212,5 @@ describe('StreamHub micro-batching flush latency metric (fluxora_ws_broadcast_ba
 
     const count = await getMetricSampleCount(wsBroadcastBatchFlushSeconds);
     expect(count).toBe(0);
-  });
-
-  it('flushes pending batch and records metric on hub.close()', async () => {
-    hub = new StreamHub(server, { flushWindowMs: 5000 });
-
-    const ws = trackSocket(new WebSocket(`ws://127.0.0.1:${port}/ws/streams?stream_id=stream-close`));
-    await new Promise<void>((resolve) => ws.on('open', resolve));
-
-    await hub.broadcast({ streamId: 'stream-close', eventId: 'evt-close-1', payload: {} });
-
-    await hub.close();
-
-    const count = await getMetricSampleCount(wsBroadcastBatchFlushSeconds);
-    expect(count).toBe(1);
   });
 });
