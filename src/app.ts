@@ -37,6 +37,7 @@ import {
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { requireJsonContentType } from './middleware/contentType.js';
 import { requireJsonAccept } from './middleware/acceptNegotiation.js';
+import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
@@ -346,6 +347,7 @@ export function createApp(options: AppOptions = {}): Express {
   // even when JSON parsing throws and the error handler fires immediately.
   app.use(correlationIdMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
+  app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
