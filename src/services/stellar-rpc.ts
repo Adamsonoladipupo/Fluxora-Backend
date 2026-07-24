@@ -21,6 +21,7 @@
 import { AsyncLocalStorage } from 'async_hooks';
 import { logger } from '../lib/logger.js';
 import { recordCircuitBreakerTransition } from '../tracing/hooks.js';
+import { getActiveTraceContext, buildTraceparent } from '../tracing/middleware.js';
 import {
   NoOpRpcFallbackCache,
   RedisRpcFallbackCache,
@@ -36,6 +37,7 @@ import {
   rpcFallbackCacheHitsTotal,
   rpcFallbackCacheMissesTotal,
 } from '../metrics/rpcMetrics.js';
+import { withJitteredRetry } from '../lib/retry.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -58,6 +60,10 @@ export interface RpcCallOptions {
   timeoutMs?: number;
   /** Optional AbortSignal to cancel the call externally. */
   signal?: AbortSignal;
+  /** Max retries for RPC calls. Default 3. */
+  maxRetries?: number;
+  /** Base delay for retries. Default 1000ms. */
+  retryDelayMs?: number;
 }
 
 export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCallOptions {
@@ -239,6 +245,8 @@ export interface RawRpcClient {
 export class StellarRpcService {
   private readonly breaker: CircuitBreaker;
   private readonly timeoutMs: number;
+  private readonly maxRetries: number;
+  private readonly retryDelayMs: number;
   private readonly fallbackCache: RpcFallbackCache;
   private readonly fallbackCacheTtlSeconds: number;
   private readonly fallbackCacheEarlyExpiryBeta: number;
@@ -250,6 +258,8 @@ export class StellarRpcService {
   ) {
     this.breaker = new CircuitBreaker(opts);
     this.timeoutMs = opts.timeoutMs ?? 5_000;
+    this.maxRetries = opts.maxRetries ?? 3;
+    this.retryDelayMs = opts.retryDelayMs ?? 1_000;
     this.fallbackCache = opts.fallbackCache ?? new NoOpRpcFallbackCache();
     this.fallbackCacheTtlSeconds = opts.fallbackCacheTtlSeconds ?? 300;
     this.fallbackCacheEarlyExpiryBeta = Math.max(0, opts.fallbackCacheEarlyExpiryBeta ?? 0);
@@ -289,7 +299,15 @@ export class StellarRpcService {
     return this.callWithFallbackCache(
       'getLatestLedger',
       [],
-      () => this.getClient().getLatestLedger(),
+      () => withJitteredRetry(
+        () => this.getClient().getLatestLedger(),
+        {
+          baseDelayMs: this.retryDelayMs,
+          maxDelayMs: this.retryDelayMs * 5,
+          maxAttempts: this.maxRetries + 1,
+        },
+        (err) => err instanceof RpcProviderError && err.kind !== 'CANCELLED'
+      ),
       opts,
     );
   }
@@ -308,22 +326,46 @@ export class StellarRpcService {
     return this.callWithFallbackCache(
       'accountExists',
       [hashCachePart(address)],
-      async () => {
-        const client = this.getClient();
-        const base = (client.horizonUrl ?? '').replace(/\/$/, '');
-        if (!base) {
-          throw new RpcProviderError('horizonUrl not configured on RPC client', 'PROVIDER');
-        }
-        const url = `${base}/accounts/${encodeURIComponent(address)}`;
-        const res = await fetch(url, { signal: AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs) });
-        if (res.status === 200) return true;
-        if (res.status === 404) return false;
-        throw new RpcProviderError(
-          `Horizon returned HTTP ${res.status} for account lookup`,
-          'PROVIDER',
-          res.status,
-        );
-      },
+      () => withJitteredRetry(
+        async () => {
+          const client = this.getClient();
+          const base = (client.horizonUrl ?? '').replace(/\/$/, '');
+          if (!base) {
+            throw new RpcProviderError('horizonUrl not configured on RPC client', 'PROVIDER');
+          }
+          const url = `${base}/accounts/${encodeURIComponent(address)}`;
+          // Attach outbound W3C traceparent so Stellar RPC / Horizon can
+          // continue the distributed trace.  The header is only added when an
+          // active trace context exists in the current async scope.
+          const rpcHeaders: Record<string, string> = {};
+          const activeTrace = getActiveTraceContext();
+          if (activeTrace) {
+            // Outbound parent ID = upstream parentId so the outbound span
+            // shares the same parent as this service's span.
+            rpcHeaders['traceparent'] = buildTraceparent(
+              activeTrace.traceId,
+              activeTrace.parentId,
+              activeTrace.sampled,
+            );
+          }
+          const res = await fetch(url, {
+            signal: AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs),
+            headers: rpcHeaders,
+          });          if (res.status === 200) return true;
+          if (res.status === 404) return false;
+          throw new RpcProviderError(
+            `Horizon returned HTTP ${res.status} for account lookup`,
+            'PROVIDER',
+            res.status,
+          );
+        },
+        {
+          baseDelayMs: this.retryDelayMs,
+          maxDelayMs: this.retryDelayMs * 5,
+          maxAttempts: this.maxRetries + 1,
+        },
+        (err) => err instanceof RpcProviderError && err.kind !== 'CANCELLED'
+      ),
       opts,
     );
   }
@@ -552,6 +594,8 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
       windowMs: parseInt(process.env.RPC_CB_WINDOW_MS ?? '30000', 10),
       resetTimeoutMs: parseInt(process.env.RPC_CB_RESET_TIMEOUT_MS ?? '60000', 10),
       timeoutMs: parseInt(process.env.RPC_TIMEOUT_MS ?? '5000', 10),
+      maxRetries: parseInt(process.env.STELLAR_RPC_MAX_RETRIES ?? '3', 10),
+      retryDelayMs: parseInt(process.env.STELLAR_RPC_RETRY_DELAY ?? '1000', 10),
       fallbackCacheTtlSeconds: parseInt(process.env.RPC_FALLBACK_CACHE_TTL_SECONDS ?? '300', 10),
       fallbackCacheEarlyExpiryBeta: parseFloat(process.env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA ?? '0'),
       fallbackCache: redisFallbackCache,

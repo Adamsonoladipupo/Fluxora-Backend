@@ -44,7 +44,7 @@ import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { STALE_CURSOR_ERROR_CODE, StaleCursorError, type ContractEventStore } from '../indexer/store.js';
-import { SSE_STREAM_UPDATE_EVENT, sseEventBus } from '../streams/sseEmitter.js';
+import { SSE_STREAM_UPDATE_EVENT, sseEventBus, SSE_CLOSE_REASONS } from '../streams/sseEmitter.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { getTracer } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
@@ -64,6 +64,7 @@ import {
 import {
   collectWsBackpressureMetrics,
   removeWsClientBackpressureGauge,
+  recordWsBroadcastBatchFlushLatency,
   DEFAULT_WS_BACKPRESSURE_INTERVAL_MS,
   DEFAULT_WS_SLOW_CLIENT_BYTES,
   wsBatchFlushTotal,
@@ -185,6 +186,8 @@ interface ClientBatchAccumulator {
   events: BatchedEvent[];
   /** `setTimeout` handle for the pending flush. */
   timer: NodeJS.Timeout;
+  /** Timestamp (ms) the accumulator was created — i.e. when its oldest event arrived. */
+  createdAt: number;
 }
 
 interface ClientState {
@@ -211,6 +214,10 @@ export interface StreamHubBackpressureCollectorOptions {
 
 export interface StreamHubOptions {
   dedupCache?: IDedupCache;
+  /** Buffered-bytes threshold above which events are dropped for a slow client. Defaults to `BACKPRESSURE_DROP_BYTES` (1 MiB). */
+  dropBytes?: number;
+  /** Buffered-bytes threshold above which a slow client's connection is terminated. Defaults to `BACKPRESSURE_TERMINATE_BYTES` (4 MiB). */
+  terminateBytes?: number;
   /**
    * When true, upgrade requests without a valid JWT are rejected with 401.
    * Defaults to the WS_AUTH_REQUIRED environment variable.
@@ -285,6 +292,10 @@ export class StreamHub extends EventEmitter {
     return this.eventStore;
   }
 
+  public getStreamSubscriptionCount(streamId: string): number {
+    return this.streamSubscriptions.get(streamId)?.size ?? 0;
+  }
+
   private readonly metrics: BackpressureMetrics = {
     droppedMessages: 0,
     terminatedConnections: 0,
@@ -296,6 +307,13 @@ export class StreamHub extends EventEmitter {
 
   constructor(server: Server, options?: StreamHubOptions) {
     super();
+
+    if (typeof options?.dropBytes === 'number' && options.dropBytes >= 0) {
+      this.dropBytes = options.dropBytes;
+    }
+    if (typeof options?.terminateBytes === 'number' && options.terminateBytes >= 0) {
+      this.terminateBytes = options.terminateBytes;
+    }
 
     if (options?.dedupCache) {
       this.dedup = options.dedupCache;
@@ -772,17 +790,22 @@ export class StreamHub extends EventEmitter {
     return targets.length;
   }
 
-  // ── Broadcast ──────────────────────────────────────────────────────────────
+  // ── Broadcast & Micro-Batching ─────────────────────────────────────────────
 
   async broadcast(event: StreamUpdateEvent): Promise<void> {
-    const { streamId, eventId, payload } = event;
+    const { streamId, eventId } = event;
 
-    if (await this.dedup.has(streamId, eventId)) return;
-    await this.dedup.add(streamId, eventId);
+    const added = await this.dedup.add(streamId, eventId);
+    if (!added) return;
 
     // Emit to Server-Sent Events bus
     sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, event);
 
+    this.dispatchImmediate(event);
+  }
+
+  private dispatchImmediate(event: StreamUpdateEvent): void {
+    const { streamId, eventId, payload } = event;
     const subscribers = this.matchingSubscribers(event);
     if (subscribers.size === 0) return;
 
@@ -823,9 +846,9 @@ export class StreamHub extends EventEmitter {
 
     const message = JSON.stringify({
       type: 'stream_update',
-      streamId,
-      eventId,
-      payload,
+      streamId: event.streamId,
+      eventId: event.eventId,
+      payload: event.payload,
       correlationId,
     });
 
@@ -874,7 +897,7 @@ export class StreamHub extends EventEmitter {
       // Allow the process to exit without waiting for the timer.
       if (typeof timer.unref === 'function') timer.unref();
 
-      acc = { events: [], timer };
+      acc = { events: [], timer, createdAt: Date.now() };
       this.batchAccumulators.set(key, acc);
     }
 
@@ -884,7 +907,7 @@ export class StreamHub extends EventEmitter {
     if (acc.events.length >= this.batchMaxSize) {
       clearTimeout(acc.timer);
       this.batchAccumulators.delete(key);
-      this.flushBatchDirect(ws, entry.streamId, acc.events, true);
+      this.flushBatchDirect(ws, entry.streamId, acc.events, true, acc.createdAt);
     }
   }
 
@@ -904,7 +927,7 @@ export class StreamHub extends EventEmitter {
     this.batchAccumulators.delete(key);
 
     const streamId = key.slice(key.indexOf(':') + 1);
-    this.flushBatchDirect(ws, streamId, acc.events, earlyFlush);
+    this.flushBatchDirect(ws, streamId, acc.events, earlyFlush, acc.createdAt);
   }
 
   /**
@@ -936,8 +959,12 @@ export class StreamHub extends EventEmitter {
     streamId: string,
     events: BatchedEvent[],
     earlyFlush: boolean,
+    createdAt: number,
   ): void {
     if (events.length === 0) return;
+
+    recordWsBroadcastBatchFlushLatency((Date.now() - createdAt) / 1000);
+
     if (ws.readyState !== WebSocket.OPEN) return;
 
     // Trim to MAX_MESSAGE_BYTES safety cap (in-order, keep first N events).
@@ -1214,6 +1241,18 @@ export class StreamHub extends EventEmitter {
     return this.clients.entries();
   }
 
+  /**
+   * Internal entry-point used by the subscription cardinality collector to
+   * enumerate stream subscription counts. Underscore-prefixed because it
+   * exposes internal map references — callers MUST treat them as read-only.
+   *
+   * @security Exposes only streamId keys and subscriber Set sizes; no
+   *           WebSocket references or client state is leaked.
+   */
+  _getStreamSubscriptions(): ReadonlyMap<string, Set<WebSocket>> {
+    return this.streamSubscriptions;
+  }
+
   getMetrics(): Readonly<BackpressureMetrics> {
     return { ...this.metrics };
   }
@@ -1318,6 +1357,13 @@ export class StreamHub extends EventEmitter {
     this.batchAccumulators.clear();
     if (this.ownsDedup) await this.dedup.close();
     this.wss.close(cb);
+  }
+
+  async gracefulClose(): Promise<void> {
+    for (const ws of this.clients.keys()) {
+      ws.close(1001, JSON.stringify({ reason: SSE_CLOSE_REASONS.SERVER_SHUTDOWN }));
+    }
+    await this.close();
   }
 
   async _resetDedup(): Promise<void> {

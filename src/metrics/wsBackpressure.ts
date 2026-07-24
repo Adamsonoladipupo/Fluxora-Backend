@@ -1,10 +1,11 @@
 /**
  * src/metrics/wsBackpressure.ts
  *
- * Per-client WebSocket backpressure gauges and micro-batching counters
- * exposed to Prometheus.
+ * Per-client WebSocket backpressure gauges, subscription cardinality
+ * metrics, and micro-batching counters exposed to Prometheus.
  *
- * ### Backpressure gauges (three series)
+ * Four metrics are emitted for live WebSocket subscribers on the
+ * `/ws/streams` endpoint:
  *
  *   - `fluxora_ws_backpressure_buffered_bytes{connection_id="…"}` — current
  *     `ws.bufferedAmount` per client, useful for finding a specific slow
@@ -14,6 +15,21 @@
  *     live clients (low cardinality, suitable for dashboards/alerts).
  *   - `fluxora_ws_slow_clients`           — count of clients whose buffered
  *     bytes exceed the configurable warning threshold (default 1 MiB).
+ *   - `fluxora_ws_stream_subscriber_count{stream_id="…"}` — subscriber
+ *     count for the top-N streams by fan-out size (default N=20). Reports
+ *     only the most-subscribed streams so operators can spot a single hot
+ *     stream driving disproportionate broadcast fan-out before it causes
+ *     backpressure incidents.
+ *
+ * ### Micro-batching counters (three series)
+ *
+ *   - `fluxora_ws_batch_flush_total`         — total flush operations (each
+ *     flush produces one outbound `stream_update_batch` frame per client).
+ *   - `fluxora_ws_batch_events_coalesced_total` — total individual events
+ *     that were coalesced across all flushes.  Comparing this to
+ *     `fluxora_ws_batch_flush_total` gives the average batch size.
+ *   - `fluxora_ws_batch_size_exceeded_total` — flushes where the batch hit
+ *     `WS_BATCH_MAX_SIZE` before the flush window expired (early ejection).
  *
  * ### Micro-batching counters (three series)
  *
@@ -33,7 +49,7 @@
  * and bounded-cardinality guarantee.
  */
 
-import { Counter, Gauge } from 'prom-client';
+import { Counter, Gauge, Histogram } from 'prom-client';
 import { registry } from '../metrics.js';
 import type { StreamHub } from '../ws/hub.js';
 
@@ -54,6 +70,15 @@ export const DEFAULT_WS_SLOW_CLIENT_BYTES = 1 * 1024 * 1024;
 export const DEFAULT_WS_BACKPRESSURE_INTERVAL_MS = 5_000;
 
 // ── Backpressure gauges ────────────────────────────────────────────────────────
+
+/**
+ * Maximum number of streams reported by the subscription cardinality gauge.
+ * Capping this prevents unbounded Prometheus label cardinality when many
+ * streams each have a handful of subscribers — only the top-N most-subscribed
+ * streams are exposed. Streams that drop out of the top-N between collection
+ * cycles have their gauge series removed so stale labels don't persist.
+ */
+export const DEFAULT_WS_STREAM_CARDINALITY_TOP_N = 20;
 
 /**
  * Per-client backpressure gauge. Labels are intentionally limited to
@@ -162,8 +187,42 @@ export const wsBatchSizeExceededTotal =
 // ── Collection helpers ─────────────────────────────────────────────────────────
 
 /**
- * Poll the hub for current `ws.bufferedAmount` values and update all three
- * backpressure gauges.  Safe to call concurrently — prom-client label writes
+ * Subscriber count for the top-N streams by fan-out size. Labelled by
+ * `stream_id` so operators can identify which stream is driving the most
+ * broadcast work.
+ *
+ * Cardinality guarantee: at most `DEFAULT_WS_STREAM_CARDINALITY_TOP_N`
+ * (20) time-series at any point. The collector sorts streams by subscriber
+ * count descending, keeps the top N, and explicitly removes stale series
+ * for streams that drop below the N-th rank between collection cycles.
+ *
+ * `@security` The `stream_id` label is the opaque stream identifier
+ * assigned by the application. It does not contain PII, client IPs, JWT
+ * subjects, or any user-controlled data that could be used for
+ * fingerprinting. The bounded cardinality prevents an attacker from
+ * inflating Prometheus memory by creating many low-subscriber streams —
+ * only the top 20 are ever exposed.
+ */
+export const wsStreamSubscriberCount =
+  (registry.getSingleMetric('fluxora_ws_stream_subscriber_count') as Gauge<'stream_id'>) ||
+  new Gauge<'stream_id'>({
+    name: 'fluxora_ws_stream_subscriber_count',
+    help: 'Subscriber count for the top-N WebSocket streams by fan-out size. Capped to prevent unbounded cardinality.',
+    labelNames: ['stream_id'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Tracks which stream_id labels are currently emitted so we can remove
+ * stale series when a stream drops out of the top-N between collection
+ * cycles. Module-scoped; reset by `resetWsBackpressureMetrics`.
+ */
+let previousTopStreamIds = new Set<string>();
+
+/**
+ * Poll the hub for current `ws.bufferedAmount` values and update all four
+ * gauges (per-client buffered, max buffered, slow clients, and top-N stream
+ * subscriber counts). Safe to call concurrently — prom-client label writes
  * are atomic within a single call, and we only read `ws.bufferedAmount` which
  * is itself node:net state.
  *
@@ -174,6 +233,7 @@ export const wsBatchSizeExceededTotal =
 export function collectWsBackpressureMetrics(
   hub: StreamHub,
   slowThresholdBytes: number = DEFAULT_WS_SLOW_CLIENT_BYTES,
+  topN: number = DEFAULT_WS_STREAM_CARDINALITY_TOP_N,
 ): void {
   let maxBuffered = 0;
   let slowCount = 0;
@@ -192,6 +252,107 @@ export function collectWsBackpressureMetrics(
   // assignment is enough to keep dashboards honest when clients churn.
   wsMaxBufferedBytes.set(maxBuffered);
   wsSlowClients.set(slowCount);
+
+  // ── Top-N stream subscriber cardinality ───────────────────────────────────
+  collectStreamSubscriberCardinality(hub, topN);
+}
+
+/**
+ * Compute the top-N streams by subscriber count and update the
+ * `fluxora_ws_stream_subscriber_count` gauge. Stale series for streams that
+ * dropped below the N-th rank are explicitly removed to keep label
+ * cardinality bounded.
+ *
+ * Complexity: O(S log S) where S = number of active streams. With the default
+ * cap of 20, at most 20 label writes + at most 20 label removals per cycle.
+ */
+function collectStreamSubscriberCardinality(
+  hub: StreamHub,
+  topN: number,
+): void {
+  if (typeof (hub as { _getStreamSubscriptions?: unknown })._getStreamSubscriptions !== 'function') {
+    return;
+  }
+  const streamSubs = hub._getStreamSubscriptions();
+
+  // Build [streamId, subscriberCount] pairs and sort descending.
+  const entries: Array<[string, number]> = [];
+  for (const [streamId, subscribers] of streamSubs) {
+    entries.push([streamId, subscribers.size]);
+  }
+  entries.sort((a, b) => b[1] - a[1]);
+
+  const currentTop = entries.slice(0, topN);
+
+  // Remove stale series for streams that were in the previous top-N but are
+  // no longer in the current top-N.
+  const currentIds = new Set<string>();
+  for (const [streamId] of currentTop) {
+    currentIds.add(streamId);
+  }
+
+  for (const prevId of previousTopStreamIds) {
+    if (!currentIds.has(prevId)) {
+      wsStreamSubscriberCount.remove({ stream_id: prevId });
+    }
+  }
+
+  // Set values for the current top-N.
+  for (const [streamId, count] of currentTop) {
+    wsStreamSubscriberCount.set({ stream_id: streamId }, count);
+  }
+
+  previousTopStreamIds = currentIds;
+}
+
+/**
+ * Millisecond-scale bucket layout for micro-batch broadcast flush latency histogram.
+ * Specifically chosen to resolve expected millisecond-scale flush windows (0.1ms to 5s).
+ */
+export const WS_BROADCAST_BATCH_FLUSH_BUCKETS = [
+  0.0001, // 0.1ms
+  0.0005, // 0.5ms
+  0.001,  // 1ms
+  0.0025, // 2.5ms
+  0.005,  // 5ms
+  0.01,   // 10ms
+  0.025,  // 25ms
+  0.05,   // 50ms
+  0.1,    // 100ms
+  0.25,   // 250ms
+  0.5,    // 500ms
+  1.0,    // 1s
+  2.5,    // 2.5s
+  5.0,    // 5s
+];
+
+/**
+ * Histogram recording the age in seconds of the oldest event included in a
+ * micro-batched WebSocket broadcast flush.
+ *
+ * Operators use this histogram to observe actual queuing delay and tune the
+ * flush-window default safely.
+ *
+ * Cardinality guarantee: O(1) fixed time-series with zero labels.
+ * `@security` Contains no PII, user identifiers, payload data, or stream IDs.
+ */
+export const wsBroadcastBatchFlushSeconds =
+  (registry.getSingleMetric('fluxora_ws_broadcast_batch_flush_seconds') as Histogram) ||
+  new Histogram({
+    name: 'fluxora_ws_broadcast_batch_flush_seconds',
+    help: 'Age in seconds of the oldest event included in a micro-batched WebSocket broadcast flush.',
+    buckets: WS_BROADCAST_BATCH_FLUSH_BUCKETS,
+    registers: [registry],
+  });
+
+/**
+ * Record a batch flush latency observation (in seconds).
+ * Called by StreamHub when a micro-batch is flushed.
+ */
+export function recordWsBroadcastBatchFlushLatency(ageSeconds: number): void {
+  if (typeof ageSeconds === 'number' && Number.isFinite(ageSeconds) && ageSeconds >= 0) {
+    wsBroadcastBatchFlushSeconds.observe(ageSeconds);
+  }
 }
 
 /**
@@ -211,12 +372,16 @@ export function removeWsClientBackpressureGauge(connectionId: string): void {
 }
 
 /**
- * Reset all WS backpressure gauges to 0/empty.  Useful between test runs.
+ * Reset all WS backpressure gauges to 0/empty and clear the subscription
+ * cardinality tracking state. Useful between test runs.
  */
 export function resetWsBackpressureMetrics(): void {
   wsClientBufferedBytes.reset();
   wsMaxBufferedBytes.set(0);
   wsSlowClients.set(0);
+  wsBroadcastBatchFlushSeconds.reset();
+  wsStreamSubscriberCount.reset();
+  previousTopStreamIds = new Set();
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────────
