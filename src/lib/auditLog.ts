@@ -30,7 +30,31 @@
 import { logger } from './logger.js';
 import { getPool, query } from '../db/pool.js';
 
-export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED' | 'INDEXER_STALL_CLEARED' | 'ADMIN_WS_DISCONNECT' | 'WS_AUTH_FAILURE';
+export type AuditAction =
+  | 'STREAM_CREATED'
+  | 'STREAM_CANCELLED'
+  | 'STREAM_STATUS_UPDATED'
+  | 'DLQ_LISTED'
+  | 'DLQ_REPLAYED'
+  | 'DLQ_PURGED'
+  | 'DLQ_CONSUMER_SUSPENDED'
+  | 'DLQ_CONSUMER_RESUMED'
+  | 'PAUSE_FLAGS_UPDATED'
+  | 'REINDEX_TRIGGERED'
+  | 'API_KEY_CREATED'
+  | 'API_KEY_ROTATED'
+  | 'API_KEY_REVOKED'
+  | 'INDEXER_STALL_CLEARED'
+  | 'ADMIN_WS_DISCONNECT'
+  | 'WS_AUTH_FAILURE'
+  /** Backup restore job was accepted and queued. */
+  | 'BACKUP_RESTORE_QUEUED'
+  /** Backup restore job began executing. */
+  | 'BACKUP_RESTORE_STARTED'
+  /** Backup restore job finished successfully. */
+  | 'BACKUP_RESTORE_COMPLETED'
+  /** Backup restore job failed with an error. */
+  | 'BACKUP_RESTORE_FAILED';
 
 /**
  * Minimal prepare/run shape used by {@link writeAuditEntryToDb}.
