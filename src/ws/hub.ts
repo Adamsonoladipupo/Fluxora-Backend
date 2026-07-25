@@ -1253,6 +1253,18 @@ export class StreamHub extends EventEmitter {
     return this.streamSubscriptions;
   }
 
+  /**
+   * Internal entry-point used by tests and diagnostics to inspect recipient
+   * subscription cardinality. Only exposes stable map and set references.
+   *
+   * @security Exposes only recipientAddress keys and subscriber Set sizes;
+   *           raw WebSocket references are still opaque and must not be
+   *           mutated by callers.
+   */
+  _getRecipientSubscriptions(): ReadonlyMap<string, Set<WebSocket>> {
+    return this.recipientSubscriptions;
+  }
+
   getMetrics(): Readonly<BackpressureMetrics> {
     return { ...this.metrics };
   }
