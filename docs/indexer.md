@@ -460,3 +460,128 @@ WHERE contract_id = 'contract-abc-123' AND ledger = 1;
 - [ ] Webhook notifications on replay completion
 - [ ] Metrics export (Prometheus format)
 - [ ] Automatic retry on transient failures
+
+
+---
+
+## gRPC Transcoding Gateway
+
+The optional gRPC gateway (`src/indexer/grpcGateway.ts`) exposes the same
+replay and ingest operations as the HTTP routes, but over a binary gRPC
+transport.  It is designed for **in-cluster service-to-service** calls where
+lower overhead and strong typing are preferred.
+
+### Enabling the gateway
+
+The gateway is **off by default** so existing HTTP-only deployments are
+unaffected.  Set the following environment variables to enable it:
+
+| Variable | Default | Description |
+|---|---|---|
+| `GRPC_GATEWAY_ENABLED` | `false` | Set to `true` to start the gateway |
+| `GRPC_GATEWAY_PORT` | `50052` | Port the gRPC server binds to |
+
+```bash
+GRPC_GATEWAY_ENABLED=true
+GRPC_GATEWAY_PORT=50052
+```
+
+> **Note:** The gateway must **not** be exposed outside the cluster.
+> It binds to `0.0.0.0` and relies on network-level isolation (Kubernetes
+> NetworkPolicies, VPC security groups, etc.) for perimeter security.
+
+### Authentication
+
+Every RPC must include a `worker_token` metadata header containing the same
+secret as `INDEXER_WORKER_TOKEN`.  Tokens are compared with a **constant-time
+equality check** to prevent timing-oracle attacks.
+
+```bash
+# grpcurl example
+grpcurl \
+  -plaintext \
+  -H 'worker_token: <INDEXER_WORKER_TOKEN>' \
+  -d '{}' \
+  localhost:50052 \
+  fluxora.indexer.v1.IndexerService/GetReplayStatus
+```
+
+### Service definition (proto)
+
+The proto schema is kept inline in `src/indexer/grpcGateway.ts` (same pattern
+as `src/health/grpcHealth.ts`) so the production Docker image does not need to
+ship `.proto` files.
+
+```protobuf
+syntax = "proto3";
+package fluxora.indexer.v1;
+
+service IndexerService {
+  // Ingest a batch of contract events from the chain worker.
+  rpc IngestContractEvents(IngestContractEventsRequest)
+      returns (IngestContractEventsResponse);
+
+  // Replay stored events with optional filtering.
+  rpc GetEvents(GetEventsRequest) returns (GetEventsResponse);
+
+  // Trigger a historical DB backfill for a given contract/ledger range.
+  rpc ReplayEvents(ReplayEventsRequest) returns (ReplayEventsResponse);
+
+  // Return current replay progress.
+  rpc GetReplayStatus(GetReplayStatusRequest) returns (GetReplayStatusResponse);
+}
+```
+
+### RPC reference
+
+#### `IngestContractEvents`
+
+Ingests a batch of on-chain contract events.  Delegates to
+`indexerIngestionService.ingest()` — the same handler as
+`POST /internal/indexer/contract-events`.
+
+**Metadata:** `worker_token` required.
+
+#### `GetEvents`
+
+Paginated read of stored events.  Supports both cursor-based pagination
+(`after_event_id`) and offset-based pagination (`limit` / `offset`).
+Delegates to `indexerIngestionService.getEvents()`.
+
+**Metadata:** `worker_token` required.
+
+#### `ReplayEvents`
+
+Triggers a historical DB backfill.  The RPC returns immediately with the
+current progress snapshot; the actual replay runs asynchronously in the
+background, mirroring the fire-and-forget behaviour of
+`POST /internal/indexer/events/replay`.
+
+**Metadata:** `worker_token` required.
+
+#### `GetReplayStatus`
+
+Returns the extended replay progress (reads from the `replay_cursors` DB table
+when available, falls back to in-memory state).  Delegates to
+`indexerService.getReplayProgressExtended()`.
+
+**Metadata:** `worker_token` required.
+
+### Security considerations
+
+- The gateway **re-uses all existing validation and business logic** — no
+  duplicated code paths.
+- Input validation for `ReplayEvents` uses the same `ReplayRequestSchema` Zod
+  schema as the HTTP route; invalid input is rejected with
+  `INVALID_ARGUMENT`.
+- Token comparison is constant-time (`XOR` over char codes) to prevent
+  timing attacks.
+- The server binds with `ServerCredentials.createInsecure()`.  In-cluster
+  mTLS should be enforced at the service mesh layer (Istio / Linkerd) rather
+  than at the application level.
+
+### Shutdown
+
+The gateway participates in graceful shutdown via `stopGrpcGatewayServer()`,
+which mirrors the force-close fallback in `src/health/grpcHealth.ts`:
+in-flight calls have up to 5 s to drain before a forced shutdown.
