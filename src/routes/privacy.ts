@@ -1,9 +1,14 @@
 /**
- * Privacy policy and consent-preference endpoints.
+ * Privacy policy, consent-preference, and GDPR right-to-erasure endpoints.
  *
  * Exposes the PII policy, data classification schema, retention schedule,
  * trust boundaries, and CCPA/BIPA-style recipient consent preferences as
- * machine-readable JSON.
+ * machine-readable JSON so that integrators and auditors can inspect what
+ * the service stores without reading source code.
+ *
+ * Also provides the GDPR / data-subject right-to-erasure endpoint
+ * (DELETE /api/privacy/erasure/:recipientAddress) for DPO-authorised
+ * scrubbing of PII columns in the streams table.
  */
 
 import { Router } from 'express';
@@ -31,6 +36,10 @@ import {
   validationError,
 } from '../middleware/errorHandler.js';
 import { successResponse } from '../utils/response.js';
+import { requireAdminAuth } from '../middleware/adminAuth.js';
+import { recordAuditEventToDb } from '../lib/auditLog.js';
+import { getCorrelationId } from '../tracing/middleware.js';
+import { logger } from '../lib/logger.js';
 
 export const privacyRouter = Router();
 
@@ -53,6 +62,16 @@ interface PrivacyConsentResponse {
   created_at: string;
   updated_at: string;
 }
+
+/**
+ * Redaction tombstone written over PII columns when a data-subject erasure
+ * request is fulfilled. The value is intentionally not a valid Stellar address
+ * so it cannot be mistaken for real chain data.
+ *
+ * The prefix `[REDACTED:` is machine-readable; audit tools can scan for it.
+ * The suffix `:GDPR-17]` references GDPR Article 17 (right to erasure).
+ */
+const ERASURE_TOMBSTONE = '[REDACTED:GDPR-17]';
 
 /**
  * Middleware: set security and cache headers on every privacy response.
@@ -331,3 +350,167 @@ function classificationDescription(level: DataClassification): string {
       return 'Credentials or direct PII. Never persisted, never logged.';
   }
 }
+
+// ── GDPR Right-to-Erasure ─────────────────────────────────────────────────────
+
+/**
+ * DELETE /api/privacy/erasure/:recipientAddress
+ *
+ * Fulfils a GDPR Article 17 right-to-erasure request for a data subject
+ * identified by their Stellar recipient address.
+ *
+ * What is erased:
+ *   - `sender_address`         → replaced with ERASURE_TOMBSTONE
+ *   - `recipient_address`      → replaced with ERASURE_TOMBSTONE
+ *   - `sender_address_hash`    → cleared to NULL (hash no longer valid)
+ *   - `recipient_address_hash` → cleared to NULL (hash no longer valid)
+ *
+ * What is preserved (financial / audit integrity):
+ *   - `amount`        — amounts must survive for financial audit trails
+ *   - `ledger`        — ledger sequence numbers are public chain data
+ *   - `stream_id`     — opaque internal identifier, not PII
+ *   - `status`        — stream lifecycle, not PII
+ *   - All `contract_events` rows — amounts/ledger refs are chain-public
+ *   - All `audit_logs` entries — immutable audit trail; a new entry is
+ *                                 appended for the erasure itself
+ *
+ * Security requirements:
+ *   - Requires admin or DPO Bearer token (via requireAdminAuth).
+ *   - Every call is written to audit_logs with requester identity.
+ *   - The recipient address parameter is length-bounded and validated
+ *     before use; it is never interpolated directly into SQL (parameterised).
+ *   - Streams under legal hold (legal_hold = TRUE) are skipped; their
+ *     count is reported in the response.
+ *
+ * Idempotency:
+ *   - Re-running with the same address is safe; already-tombstoned rows
+ *     match the WHERE clause only once (tombstone ≠ valid address).
+ *
+ * Response codes:
+ *   200 — erasure completed (may be 0 rows if address not found)
+ *   400 — invalid recipientAddress parameter
+ *   401 — missing Authorization header
+ *   403 — invalid credentials
+ *   500 — internal error (audit entry still attempted)
+ */
+privacyRouter.delete(
+  '/erasure/:recipientAddress',
+  requireAdminAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    const { recipientAddress } = req.params;
+    const correlationId = getCorrelationId();
+
+    // ── Input validation ──────────────────────────────────────────────────
+    if (
+      typeof recipientAddress !== 'string' ||
+      recipientAddress.trim().length === 0 ||
+      recipientAddress.length > 256
+    ) {
+      res.status(400).json({
+        error: {
+          code: 'INVALID_ADDRESS',
+          message: 'recipientAddress must be a non-empty string of at most 256 characters.',
+        },
+      });
+      return;
+    }
+
+    const address = recipientAddress.trim();
+
+    logger.info('PII erasure request received', correlationId, {
+      event: 'pii_erasure_request',
+      addressPrefix: address.substring(0, 8),
+    });
+
+    const pool = getPool();
+
+    try {
+      const result = await query(
+        pool,
+        `UPDATE streams
+            SET sender_address        = $1,
+                recipient_address     = $1,
+                sender_address_hash   = NULL,
+                recipient_address_hash = NULL
+          WHERE (recipient_address = $2 OR sender_address = $2)
+            AND COALESCE(legal_hold, FALSE) = FALSE`,
+        [ERASURE_TOMBSTONE, address],
+      );
+
+      const rowsErased = result.rowCount ?? 0;
+
+      const holdResult = await query(
+        pool,
+        `SELECT COUNT(*) AS cnt
+           FROM streams
+          WHERE (recipient_address = $1 OR sender_address = $1)
+            AND legal_hold = TRUE`,
+        [address],
+      );
+      const rowsSkippedLegalHold = parseInt(
+        (holdResult.rows[0] as { cnt: string } | undefined)?.cnt ?? '0',
+        10,
+      );
+
+      try {
+        await recordAuditEventToDb(
+          'PII_ERASURE_REQUESTED',
+          'streams',
+          address.substring(0, 8) + '…',
+          correlationId,
+          {
+            rowsErased,
+            rowsSkippedLegalHold,
+            requestedBy: (req.headers.authorization ?? '').substring(0, 16) + '…',
+          },
+        );
+      } catch (auditErr) {
+        logger.error('Failed to write erasure audit entry', correlationId, {
+          event: 'pii_erasure_audit_failed',
+          error: auditErr instanceof Error ? auditErr.message : String(auditErr),
+        });
+      }
+
+      logger.info('PII erasure completed', correlationId, {
+        event: 'pii_erasure_completed',
+        rowsErased,
+        rowsSkippedLegalHold,
+      });
+
+      res.status(200).json({
+        erased: true,
+        rowsErased,
+        rowsSkippedLegalHold,
+        message:
+          rowsSkippedLegalHold > 0
+            ? `${rowsErased} row(s) erased. ${rowsSkippedLegalHold} row(s) skipped due to legal hold.`
+            : `${rowsErased} row(s) erased.`,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error('PII erasure failed', correlationId, {
+        event: 'pii_erasure_failed',
+        error: message,
+      });
+
+      try {
+        await recordAuditEventToDb(
+          'PII_ERASURE_REQUESTED',
+          'streams',
+          address.substring(0, 8) + '…',
+          correlationId,
+          { error: message, outcome: 'failed' },
+        );
+      } catch {
+        // ignore nested failure
+      }
+
+      res.status(500).json({
+        error: {
+          code: 'ERASURE_FAILED',
+          message: 'An internal error occurred while processing the erasure request.',
+        },
+      });
+    }
+  },
+);
