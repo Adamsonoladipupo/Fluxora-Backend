@@ -320,6 +320,28 @@ export const EnvSchema = z.object({
   S3_BACKUP_PREFIX: optionalString('S3_BACKUP_PREFIX'),
 
   FLUXORA_SHUTDOWN: booleanEnv().optional(),
+
+  /**
+   * Tiered startup dependency probing.
+   *
+   * STARTUP_PROBE_BUDGET_MS          — total wall-clock budget for soft-tier
+   *                                    retries (Redis, Stellar RPC) before the
+   *                                    service falls back to degraded mode.
+   *                                    Default: 30 000 ms.
+   * STARTUP_PROBE_POSTGRES_TIMEOUT_MS — per-attempt timeout for the single
+   *                                    Postgres (hard-tier) probe.
+   *                                    Default: 5 000 ms.
+   * STARTUP_PROBE_REDIS_TIMEOUT_MS   — per-attempt timeout for each Redis
+   *                                    (soft-tier) retry attempt.
+   *                                    Default: 3 000 ms.
+   * STARTUP_PROBE_STELLAR_TIMEOUT_MS — per-attempt timeout for each Stellar
+   *                                    RPC (soft-tier) retry attempt.
+   *                                    Default: 5 000 ms.
+   */
+  STARTUP_PROBE_BUDGET_MS: integerEnv('STARTUP_PROBE_BUDGET_MS', 1).default(30_000),
+  STARTUP_PROBE_POSTGRES_TIMEOUT_MS: integerEnv('STARTUP_PROBE_POSTGRES_TIMEOUT_MS', 1).default(5_000),
+  STARTUP_PROBE_REDIS_TIMEOUT_MS: integerEnv('STARTUP_PROBE_REDIS_TIMEOUT_MS', 1).default(3_000),
+  STARTUP_PROBE_STELLAR_TIMEOUT_MS: integerEnv('STARTUP_PROBE_STELLAR_TIMEOUT_MS', 1).default(5_000),
 }).passthrough().superRefine((env, ctx) => {
   const stellarNetwork = resolvedStellarNetwork(env);
   const expectedPassphrase = STELLAR_NETWORK_PASSPHRASES[stellarNetwork];
@@ -378,6 +400,7 @@ export interface Config {
   redisClusterNodes?: string | undefined;
 
   stellarNetwork: StellarNetwork;
+  stellarRpcUrl: string;
   horizonUrl: string;
   horizonNetworkPassphrase: string;
   contractAddresses: ContractAddresses;
@@ -451,6 +474,21 @@ export interface Config {
   // S3 Backup Retention
   s3BackupBucket?: string | undefined;
   s3BackupPrefix?: string | undefined;
+
+  /**
+   * Tiered startup dependency probing.
+   *
+   * See `probeStartupDependencies()` in `src/config/health.ts` for details on
+   * the two-tier (hard / soft) probe strategy.
+   */
+  /** Total wall-clock budget for soft-tier retries (Redis, Stellar RPC), ms. */
+  startupProbeBudgetMs: number;
+  /** Per-attempt timeout for the single Postgres (hard-tier) probe, ms. */
+  startupProbePostgresTimeoutMs: number;
+  /** Per-attempt timeout for each Redis (soft-tier) retry attempt, ms. */
+  startupProbeRedisTimeoutMs: number;
+  /** Per-attempt timeout for each Stellar RPC (soft-tier) retry attempt, ms. */
+  startupProbeStellarTimeoutMs: number;
 }
 
 export class ConfigError extends Error {
@@ -544,6 +582,7 @@ function toConfig(env: ParsedEnv): Config {
     redisClusterNodes: env.REDIS_CLUSTER_NODES,
 
     stellarNetwork,
+    stellarRpcUrl: env.STELLAR_RPC_URL,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
     horizonNetworkPassphrase: env.HORIZON_NETWORK_PASSPHRASE ?? networkDefaults.passphrase,
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
@@ -613,6 +652,11 @@ function toConfig(env: ParsedEnv): Config {
 
     s3BackupBucket: env.S3_BACKUP_BUCKET,
     s3BackupPrefix: env.S3_BACKUP_PREFIX,
+
+    startupProbeBudgetMs: env.STARTUP_PROBE_BUDGET_MS,
+    startupProbePostgresTimeoutMs: env.STARTUP_PROBE_POSTGRES_TIMEOUT_MS,
+    startupProbeRedisTimeoutMs: env.STARTUP_PROBE_REDIS_TIMEOUT_MS,
+    startupProbeStellarTimeoutMs: env.STARTUP_PROBE_STELLAR_TIMEOUT_MS,
   };
 }
 
