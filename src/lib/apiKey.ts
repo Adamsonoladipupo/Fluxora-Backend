@@ -267,28 +267,3 @@ export function getApiKeyFromRequest(
   return key;
 }
 
-/**
- * Retrieves an active key record by raw API key value.
- * Used for authentication to get the full record (including scopes).
- * Exposed for middleware/auth use.
- *
- * Resolves candidate active rows by the indexed key prefix (O(log n)) and then
- * performs constant-time comparison against candidate hashes.
- */
-export async function getApiKeyRecord(rawKey: string): Promise<ApiKeyRecord | undefined> {
-  if (!rawKey || typeof rawKey !== 'string') {
-    return undefined;
-  }
-
-  const prefix = rawKey.slice(0, PREFIX_LENGTH);
-  const candidates = await apiKeyRepository.findActiveByPrefix(prefix);
-
-  let matchedRecord: ApiKeyRecord | undefined;
-  for (const candidate of candidates) {
-    if (hashesMatch(hashKey(rawKey, candidate.salt), candidate.keyHash)) {
-      matchedRecord = candidate;
-    }
-  }
-
-  return matchedRecord;
-}
