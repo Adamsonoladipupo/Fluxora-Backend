@@ -167,6 +167,75 @@ describe('RedisIndexerLeaderElection', () => {
   });
 });
 
+describe('RedisIndexerLeaderElection — multiple instance competition', () => {
+  let redis: FakeRedisClient;
+
+  beforeEach(() => {
+    redis = new FakeRedisClient();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    redis.reset();
+  });
+
+  it('instance B acquires leadership after instance A lease expires', async () => {
+    const leaseMs = 9000;
+    const a = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs });
+    const b = new RedisIndexerLeaderElection(redis, { instanceId: 'b', leaseMs });
+
+    // A acquires first.
+    await a.tryAcquire();
+    expect(a.isLeader()).toBe(true);
+    expect(b.isLeader()).toBe(false);
+
+    // A's heartbeat renewal stops working (simulating Redis outage / lease expiry).
+    // A's key expires and B successfully acquires.
+    await redis.del('indexer:leader-election:replay');
+    const acquired = await b.tryAcquire();
+    expect(acquired).toBe(true);
+    expect(b.isLeader()).toBe(true);
+
+    // Advance timers so A's heartbeat fires — A should detect it no longer holds the key.
+    await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
+    expect(a.isLeader()).toBe(false);
+  });
+
+  it('two instances both calling tryAcquire concurrently — only one wins', async () => {
+    const a = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs: 15_000 });
+    const b = new RedisIndexerLeaderElection(redis, { instanceId: 'b', leaseMs: 15_000 });
+
+    // Both attempt simultaneously (sequentially in test, but key is absent for both).
+    const resultA = await a.tryAcquire();
+    // The second call to tryAcquire fails because A already holds the key.
+    const resultB = await b.tryAcquire();
+
+    expect(resultA).toBe(true);
+    expect(resultB).toBe(false);
+    expect(a.isLeader()).toBe(true);
+    expect(b.isLeader()).toBe(false);
+  });
+
+  it('release by one instance allows the other to acquire', async () => {
+    const leaseMs = 9000;
+    const a = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs });
+    const b = new RedisIndexerLeaderElection(redis, { instanceId: 'b', leaseMs });
+
+    await a.tryAcquire();
+    expect(a.isLeader()).toBe(true);
+
+    // A releases gracefully.
+    await a.release();
+    expect(a.isLeader()).toBe(false);
+
+    // B can now acquire.
+    const acquired = await b.tryAcquire();
+    expect(acquired).toBe(true);
+    expect(b.isLeader()).toBe(true);
+  });
+});
+
 describe('default leader election accessor', () => {
   afterEach(() => {
     _resetIndexerLeaderElection();
