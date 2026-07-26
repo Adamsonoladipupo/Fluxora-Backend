@@ -74,4 +74,36 @@ describe('Server Timing middleware', () => {
       { name: 'serialize', durationMs: 3.75 },
     ]);
   });
+
+  it('handles res.end(chunk) without explicit encoding argument', async () => {
+    process.env.SERVER_TIMING_ENABLED = 'true';
+    const app = express();
+    app.use(serverTimingMiddleware());
+    app.get('/end-no-encoding', (_req, res) => {
+      const registry = getServerTimingRegistry(res);
+      registry.addPhase('db', 10.0);
+      res.end('response text');
+    });
+
+    const res = await request(app).get('/end-no-encoding');
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('response text');
+    expect(res.headers['server-timing']).toBe('db;dur=10');
+  });
+
+  it('handles res.end(chunk, encoding) with explicit encoding argument', async () => {
+    process.env.SERVER_TIMING_ENABLED = 'true';
+    const app = express();
+    app.use(serverTimingMiddleware());
+    app.get('/end-with-encoding', (_req, res) => {
+      const registry = getServerTimingRegistry(res);
+      registry.addPhase('db', 15.0);
+      res.end('response text', 'utf8');
+    });
+
+    const res = await request(app).get('/end-with-encoding');
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('response text');
+    expect(res.headers['server-timing']).toBe('db;dur=15');
+  });
 });
