@@ -176,8 +176,106 @@ curl "http://localhost:3000/api/streams/export?resume_from=<CURSOR_VALUE>"
 
 ## GET /api/streams/:id/export.jsonld
 
-Returns a JSON-LD document with a Fluxora-defined `@context`, enabling machine-readable, self-describing data portability for a single stream.
-The response uses `application/ld+json` Content-Type and uses string serialization for all amount fields to preserve full precision.
+Returns a JSON-LD document for a single stream, conforming to the Fluxora
+vocabulary (`https://fluxora.dev/ns/v1`). Use this endpoint for
+data-portability requirements — archives, semantic-web tooling, compliance
+exports, and cross-system interoperability — where the standard
+`application/json` envelope of `GET /api/streams/:id` is not appropriate.
+
+### Authentication
+
+Requires the same API key + `streams:read` scope as `GET /api/streams/:id`.
+
+### Response headers
+
+| Header | Value | Notes |
+| :--- | :--- | :--- |
+| `Content-Type` | `application/ld+json` | Always set; never `application/json` |
+| `ETag` | `W/"<fingerprint>"` | Weak entity-tag; same fingerprint as `GET /:id` |
+| `Last-Modified` | RFC 7231 date | Derived from `updated_at` |
+| `Cache-Control` | `public, max-age=300, stale-while-revalidate=60` | Terminal streams only |
+| `Cache-Control` | `private, no-store` | Active and paused streams |
+| `Link` | `<https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"` | JSON-LD context advertisement per spec §4.1 |
+
+### Conditional GET
+
+The endpoint honours `If-None-Match`. Pass the `ETag` value from a previous
+response to skip transferring an unchanged document:
+
+```http
+GET /api/streams/stream-abc123-0/export.jsonld
+If-None-Match: W/"abc123"
+X-API-Key: <key>
+```
+
+Returns `304 Not Modified` (no body) when the stream has not changed.
+
+### Response body
+
+The response is a raw JSON-LD object — **not** wrapped in the standard
+`{ success, data, meta }` envelope — so that linked-data processors can
+consume it directly.
+
+```json
+{
+  "@context": "https://fluxora.dev/ns/v1",
+  "@type": "PaymentStream",
+  "@id": "https://fluxora.dev/streams/stream-abc123-0",
+  "identifier": "stream-abc123-0",
+  "sender": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+  "recipient": "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN",
+  "depositAmount": "1000",
+  "streamedAmount": "100",
+  "remainingAmount": "900",
+  "ratePerSecond": "0.1",
+  "startTime": 1700000000,
+  "endTime": 0,
+  "status": "active",
+  "contractId": "CABC1234CONTRACT",
+  "transactionHash": "aaaa...aaaa"
+}
+```
+
+### Field reference
+
+| Field | JSON-LD term | Type | Description |
+| :--- | :--- | :--- | :--- |
+| `@context` | — | string | Always `https://fluxora.dev/ns/v1` |
+| `@type` | — | string | Always `PaymentStream` |
+| `@id` | — | URI | Resolvable URI uniquely identifying this stream |
+| `identifier` | `identifier` | string | Opaque stream ID derived from the on-chain event |
+| `sender` | `sender` | string | Stellar address of the fund sender |
+| `recipient` | `recipient` | string | Stellar address of the fund recipient |
+| `depositAmount` | `depositAmount` | decimal string | Total deposited amount; full precision |
+| `streamedAmount` | `streamedAmount` | decimal string | Amount already streamed; full precision |
+| `remainingAmount` | `remainingAmount` | decimal string | Amount yet to be streamed; full precision |
+| `ratePerSecond` | `ratePerSecond` | decimal string | Streaming rate in tokens/second; full precision |
+| `startTime` | `startTime` | integer | Unix timestamp (seconds) when the stream starts |
+| `endTime` | `endTime` | integer | Unix timestamp (seconds) when the stream ends; `0` = indefinite |
+| `status` | `status` | string | `active` \| `paused` \| `completed` \| `cancelled` |
+| `contractId` | `contractId` | string | Soroban contract ID governing this stream |
+| `transactionHash` | `transactionHash` | string | On-chain transaction hash |
+
+> **Precision note** — all amount fields are decimal strings to avoid
+> floating-point rounding. Trailing fractional zeros are stripped
+> (e.g. `"100.50"` is serialised as `"100.5"`).
+
+### Example
+
+```bash
+curl https://api.example.com/api/streams/stream-abc123-0/export.jsonld \
+  -H "X-API-Key: <key>" \
+  -H "Accept: application/ld+json"
+```
+
+### Error responses
+
+| Status | Code | Cause |
+| :--- | :--- | :--- |
+| `401` | `UNAUTHORIZED` | Missing or invalid API key |
+| `403` | `FORBIDDEN` | API key lacks `streams:read` scope |
+| `404` | `NOT_FOUND` | Stream does not exist |
+| `503` | `SERVICE_UNAVAILABLE` | Database connection pool exhausted |
 
 ## Method Overrides
 
