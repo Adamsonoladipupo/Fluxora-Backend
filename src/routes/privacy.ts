@@ -290,7 +290,7 @@ privacyRouter.put(
     }
 
     const row = result!.rows[0];
-    res.status(200).json(successResponse({ consent: toConsentResponse(row!) }, req.id));
+    res.status(200).json(successResponse({ consent: toConsentResponse(row!) }, getCorrelationId()));
   }),
 );
 privacyRouter.all('/consent', rejectUnsupportedMethods(['PUT']));
@@ -331,7 +331,7 @@ privacyRouter.get(
     const row = result!.rows[0];
     if (!row) throw notFound('Privacy consent');
 
-    res.json(successResponse({ consent: toConsentResponse(row) }, req.id));
+    res.json(successResponse({ consent: toConsentResponse(row) }, getCorrelationId()));
   }),
 );
 privacyRouter.all('/consent/:address', rejectUnsupportedMethods(['GET', 'HEAD']));
