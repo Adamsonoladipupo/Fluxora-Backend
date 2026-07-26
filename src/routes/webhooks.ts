@@ -17,6 +17,18 @@ import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { logger } from '../lib/logger.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { OffsetPaginationSchema } from '../validation/paginationSchema.js';
+import { InMemoryDedupCache } from '../redis/dedup.js';
+import type { DedupCache } from '../redis/dedup.js';
+
+let inboundWebhookDedupCache: DedupCache = new InMemoryDedupCache();
+
+export function setInboundWebhookDedupCache(cache: DedupCache): void {
+  inboundWebhookDedupCache = cache;
+}
+
+export function getInboundWebhookDedupCache(): DedupCache {
+  return inboundWebhookDedupCache;
+}
 
 export const webhooksRouter = express.Router();
 
@@ -29,22 +41,21 @@ export const webhooksRouter = express.Router();
  * POST /internal/webhooks/receive
  *
  * Verifies an incoming Fluxora webhook delivery against the shared secret.
+ * Deduplicates using `inboundWebhookDedupCache` (24h TTL, max 10,000 entries per instance).
  * Returns a flat envelope (not the standard successResponse / errorResponse
  * shape) so callers can rely on stable HTTP status codes and the
  * `error` string match the documented `WebhookVerificationCode` values.
  */
-const seenDeliveries = new Set<string>();
 webhooksRouter.post(
   '/receive',
   express.raw({ type: '*/*', limit: '1mb' }),
-  (req, res): void => {
+  async (req, res): Promise<void> => {
     const rawBody = req.body as Buffer;
     const headers = req.headers as Record<string, string | undefined>;
     // `verifyWebhookSignature` uses exact-optional types — only forward
     // properties when they are actually set.
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
-      isDuplicateDelivery: (id: string) => seenDeliveries.has(id),
     };
     if (process.env.FLUXORA_WEBHOOK_SECRET !== undefined) {
       verifyInput.secret = process.env.FLUXORA_WEBHOOK_SECRET;
@@ -66,7 +77,12 @@ webhooksRouter.post(
     }
 
     const deliveryId = headers['x-fluxora-delivery-id']!;
-    seenDeliveries.add(deliveryId);
+    
+    const isNew = await inboundWebhookDedupCache.add('webhook', deliveryId);
+    if (!isNew) {
+      res.status(409).json({ error: 'duplicate_delivery', message: 'Duplicate delivery id' });
+      return;
+    }
 
     let parsed: unknown;
     try {
