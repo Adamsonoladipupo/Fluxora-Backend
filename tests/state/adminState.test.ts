@@ -8,10 +8,13 @@ import {
   isStreamCreationPaused,
   getReindexState,
   triggerReindex,
+  initializeAdminStateLock,
   AdminStatePersistenceError,
   _resetForTest,
   _reloadPauseFlagsFromPersistenceForTest,
 } from '../../src/state/adminState.js';
+import { RedisDistributedLock } from '../../src/state/adminStateLock.js';
+import { NoOpRedisClient } from '../../src/redis/client.js';
 
 describe('adminState', () => {
   let originalAdminStateFile: string | undefined;
@@ -151,6 +154,34 @@ describe('adminState', () => {
 
       // All writes should have completed
       expect(writeOrder).toHaveLength(3);
+    });
+
+    it('exercises fallback locking path when no Redis is initialized', async () => {
+      _resetForTest();
+      const updated = await setPauseFlags({ streamCreation: true });
+      expect(updated.streamCreation).toBe(true);
+
+      _reloadPauseFlagsFromPersistenceForTest();
+      expect(getPauseFlags().streamCreation).toBe(true);
+    });
+
+    it('exercises locking path after initializeAdminStateLock', async () => {
+      _resetForTest();
+      initializeAdminStateLock(new NoOpRedisClient());
+      const updated = await setPauseFlags({ ingestion: true });
+      expect(updated.ingestion).toBe(true);
+
+      _reloadPauseFlagsFromPersistenceForTest();
+      expect(getPauseFlags().ingestion).toBe(true);
+    });
+
+    it('verifies RedisDistributedLock implements Lock interface acquire and release', async () => {
+      const lock = new RedisDistributedLock(new NoOpRedisClient(), 'testNamespace');
+      const acquired = await lock.acquire();
+      expect(typeof acquired.acquire).toBe('function');
+      expect(typeof acquired.release).toBe('function');
+      await acquired.release();
+      await lock.release();
     });
   });
 

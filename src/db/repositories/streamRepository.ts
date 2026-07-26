@@ -22,6 +22,10 @@
  *   logged or included in error messages.  Key rotation is supported via an
  *   optional PGCRYPTO_KEY_PREVIOUS.
  *
+ * Typed row mapping:
+ *   Never pass a bare domain interface to `query<T>()`. Query with
+ *   `Record<string, unknown>` and map through `rowToRecord()` (see README.md).
+ *
  * @module db/repositories/streamRepository
  */
 
@@ -333,19 +337,22 @@ export const streamRepository = {
    * @param afterId       - Exclusive lower bound for keyset pagination.
    * @param includeTotal  - When `true`, a separate COUNT(*) query is executed
    *   and returned as `total`.
+   * @param options       - Optional routing overrides.  Pass `{ forcePrimary: true }`
+   *   to route this read to the primary pool (read-your-writes consistency).
    */
   async findWithCursor(
     filter: StreamFilter,
     limit: number,
     afterId?: string,
     includeTotal?: boolean,
+    options?: { forcePrimary?: boolean },
   ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
     return timed('findWithCursor', async () => {
       const effectiveLimit = Math.min(Math.max(limit, 1), MAX_PAGE_SIZE);
       if (effectiveLimit !== limit) {
         debug('findWithCursor: limit clamped', { requested: limit, effective: effectiveLimit });
       }
-      const pool = await getReadPool();
+      const pool = await getReadPool({ forcePrimary: options?.forcePrimary });
       const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
       const params: unknown[] = [];

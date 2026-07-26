@@ -4,6 +4,22 @@
 
 Fluxora Backend uses a `pg.Pool` (node-postgres) for all database access. The pool is configured via environment variables and includes proactive exhaustion detection to prevent unbounded request queuing.
 
+## Typed Row Mapping
+
+`pg.Pool.query<T>()` / `PoolClient.query<T>()` constrain `T` to `QueryResultRow` (an index signature). **Do not** pass bare domain interfaces (`ReplayCursor`, `ContractEvent`, `VacuumRow`, `StreamRecord`, …) as that generic — they fail `tsc` with `TS2344`.
+
+**Required pattern** (already used in `streamRepository`, `apiKeyRepository`, `dlqRepository`):
+
+1. Query with `Record<string, unknown>` (or omit the generic).
+2. Map each row through an explicit `rowToX()` helper into the domain type.
+
+```ts
+const result = await client.query<Record<string, unknown>>(sql, params);
+return result.rows.map(rowToReplayCursor);
+```
+
+Full convention: [`src/db/repositories/README.md`](../src/db/repositories/README.md).
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -148,6 +164,14 @@ The `contract_events` table is partitioned by `happened_at` to ensure bounded gr
 4. Validate that detached partitions are backed up per the existing S3 retention policy before actually dropping them.
 5. Run the function in `dryRun = true` mode initially to audit partitions that will be dropped.
 
+### Partition Pre-creation
+
+To avoid rows landing in the unindexed `DEFAULT` partition, partitions for the next 3 months are pre-created by the background job `src/jobs/partitionMaintenance.ts`.
+
+1. The job runs every 24 hours.
+2. It uses `pg_try_advisory_lock` to prevent concurrent execution.
+3. If partition creation falls behind, the job logs an error and should be monitored for alerting.
+
 ### Recommended alert thresholds
 
 ```yaml
@@ -286,3 +310,106 @@ If a consumer is decommissioned or experiences an extended outage and lag exceed
   severity: warning
 ```
 
+---
+
+## PgBouncer / PgCat Transaction-Pooling Compatibility (issue #754)
+
+At higher connection scale operators commonly front PostgreSQL with
+[PgBouncer](https://www.pgbouncer.org/) or
+[PgCat](https://github.com/levkk/pgcat) in **transaction-pooling mode**
+(`pool_mode = transaction`). This mode returns the server connection to the
+pooler after every transaction rather than keeping it pinned for the
+lifetime of the client connection, enabling many more app connections than
+Postgres server connections.
+
+### Why transaction-pooling is incompatible with the default pool setup
+
+Two features of a plain `pg.Pool` are session-scoped and silently break under
+transaction pooling:
+
+| Feature | Session mode | Transaction mode |
+|---|---|---|
+| `SET statement_timeout = $1` on `connect` | ✅ Works — persists for connection lifetime | ❌ Silently lost — pooler resets session on each transaction boundary |
+| pg driver prepared-statement cache | ✅ Works | ❌ PgBouncer rejects `PREPARE` / `EXECUTE` |
+
+### ⚠ Silent failure mode
+
+If you are running behind a transaction pooler but `POOL_MODE` is **not** set
+to `transaction`, the `SET statement_timeout` call succeeds from the app's
+perspective but is silently discarded by PgBouncer. Queries run **without
+any application-side timeout**. This is not a crash — it is a silent
+correctness failure. Setting `POOL_MODE=transaction` explicitly acknowledges
+and handles this condition.
+
+### Configuration
+
+Set the `POOL_MODE` environment variable:
+
+```bash
+# Session pooling (default — direct Postgres connection or session pooler)
+POOL_MODE=session
+
+# Transaction pooling — use when PgBouncer/PgCat is in transaction mode
+POOL_MODE=transaction
+```
+
+When `POOL_MODE=transaction`:
+
+- The `connect` hook skips `SET statement_timeout`. Configure
+  `statement_timeout` at the pooler layer instead (e.g., pgbouncer.ini
+  `server_reset_query` or `ALTER ROLE app_user SET statement_timeout = '5s'`).
+- A startup warning is logged with `event: pool_transaction_mode_active`.
+
+### Local verification with Docker Compose
+
+A `pgbouncer` Docker Compose profile is provided for local testing:
+
+```bash
+# Start Postgres + PgBouncer in transaction mode
+docker compose --profile pgbouncer up -d
+
+# Connect through PgBouncer (port 6432)
+DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:6432/indexer_db \
+  POOL_MODE=transaction \
+  pnpm dev
+```
+
+The PgBouncer container (`bitnami/pgbouncer:1.22.0`) is configured with
+`PGBOUNCER_POOL_MODE=transaction` and `PGBOUNCER_DEFAULT_POOL_SIZE=20`.
+Port `6432` is bound to `127.0.0.1` only.
+
+### API
+
+```typescript
+import { isTransactionPoolMode } from './src/db/pool.js';
+
+// Check if the active pool is in transaction mode
+if (isTransactionPoolMode()) {
+  // Do not rely on session-scoped state
+}
+```
+
+### Environment variable reference
+
+| Variable | Values | Default | Description |
+|---|---|---|---|
+| `POOL_MODE` | `session` \| `transaction` | `session` | Pool compatibility mode. Set to `transaction` when using PgBouncer/PgCat in transaction-pooling mode. |
+
+---
+
+## Partition Pruning for `contract_events`
+
+### Overview & Range Partitioning Strategy
+
+The `contract_events` table is partitioned by range on `happened_at` (`PARTITION BY RANGE (happened_at)`) per migration `20260627000000_contract_events_partitioning.ts`. Range partitioning bounds disk growth and enables aggressive partition pruning during historical range queries.
+
+### Query Predicate Requirements & Pruning Behavior
+
+PostgreSQL partition pruning is driven by predicates on the partition key (`happened_at`). When `StreamEventReplayFilter` query parameters (`fromHappenedAt`, `toHappenedAt`) are passed to `PostgresContractEventStore.getEvents()`, PostgreSQL's query planner automatically prunes non-overlapping partition tables from the execution plan.
+
+- **Single-Partition Bounded Queries**: Queries bounded to a single month (e.g. `happened_at >= '2026-07-01T00:00:00.000Z' AND happened_at <= '2026-07-31T23:59:59.999Z'`) evaluate to an execution plan containing strictly the target partition (e.g., `contract_events_y2026m07`). Other partitions (`contract_events_y2026m06`, `contract_events_y2026m08`, `contract_events_default`) are pruned and omitted from disk scans.
+- **Cross-Partition Range Queries**: Queries spanning multiple partition boundaries (e.g., `happened_at >= '2026-06-15T00:00:00.000Z' AND happened_at <= '2026-07-15T23:59:59.999Z'`) scan only the specific matching partitions (`contract_events_y2026m06` and `contract_events_y2026m07`), excluding irrelevant partitions.
+
+### Verification via EXPLAIN
+
+Partition pruning efficiency is verified via integration tests (`tests/db/contractEvents.partitionPruning.test.ts`) that execute `EXPLAIN (FORMAT JSON)` against representative store query shapes and inspect the plan output structure.

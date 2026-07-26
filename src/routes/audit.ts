@@ -62,7 +62,7 @@ function sanitizeEntry(entry: AuditEntry): AuditEntry {
 
 auditRouter.get('/', authenticate, requireAuth, requirePermission(Permission.AUDIT_READ), (req, res, next) => {
   try {
-    const requestId = req.id;
+    const requestId = req.correlationId;
 
     // ── Pagination parameter validation ──────────────────────────────────────
     const rawLimit = req.query['limit'];

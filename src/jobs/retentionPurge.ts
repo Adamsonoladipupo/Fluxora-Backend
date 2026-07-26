@@ -64,6 +64,8 @@ import type { Pool, PoolClient } from 'pg';
 import { recordAuditEventToDb } from '../lib/auditLog.js';
 import { PURGEABLE_RETENTION_SCHEDULE, PurgeableRetentionRule } from '../pii/policy.js';
 
+const STREAM_REDACTION_TOMBSTONE = '[REDACTED:DATA_RETENTION]';
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /**
@@ -338,7 +340,14 @@ async function processBatch(
     if (!dryRun && purged > 0) {
       // One PURGE_INITIATED event per batch (not per row) to keep the audit
       // log concise.  The meta includes the count for downstream analysis.
-      await writePurgeAuditEvent(client, rule, purged, cutoff.toISOString(), batchIndex, correlationId);
+      await writePurgeAuditEvent(
+        client,
+        rule,
+        purged,
+        cutoff.toISOString(),
+        batchIndex,
+        correlationId
+      );
     }
 
     await client.query('COMMIT');
@@ -425,9 +434,21 @@ async function purgeRow(
 
   if (rule.purgeAction === 'delete') {
     await client.query(`DELETE FROM ${tableId} WHERE id = $1`, [primaryKey]);
+  } else if (rule.table === 'streams') {
+    // Redact stream PII columns while preserving the stream row for audit
+    // and chain-derived consistency.
+    await client.query(
+      `UPDATE ${tableId}
+          SET sender_address        = $1,
+              recipient_address     = $1,
+              sender_address_hash   = NULL,
+              recipient_address_hash = NULL,
+              updated_at            = NOW()
+        WHERE id = $2`,
+      [STREAM_REDACTION_TOMBSTONE, primaryKey]
+    );
   } else {
-    // Redact: overwrite sensitive columns and stamp purge time.
-    // For now we set a generic placeholder; extend this per-table as needed.
+    // Generic redact path for tables that retain the row shell for auditability.
     await client.query(
       `UPDATE ${tableId}
           SET meta = jsonb_build_object('purged', true),
@@ -492,13 +513,10 @@ async function writeSkippedAuditEvent(
   // Fire-and-forget: legal-hold skips are best-effort audit records.
   // A failed write here must not abort the purge batch.
   try {
-    await recordAuditEventToDb(
-      'PURGE_SKIPPED_LEGAL_HOLD',
-      rule.table,
-      primaryKey,
-      correlationId,
-      { table: rule.table, reason: 'legal_hold = TRUE' }
-    );
+    await recordAuditEventToDb('PURGE_SKIPPED_LEGAL_HOLD', rule.table, primaryKey, correlationId, {
+      table: rule.table,
+      reason: 'legal_hold = TRUE',
+    });
   } catch (err) {
     logger.error('Retention purge: failed to write legal-hold skip audit event', correlationId, {
       table: rule.table,

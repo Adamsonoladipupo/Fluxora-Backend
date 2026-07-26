@@ -268,6 +268,39 @@ export function getApiKeyFromRequest(
 }
 
 /**
+ * Resolves a raw API key to its full {@link ApiKeyRecord} (including scopes),
+ * or `undefined` if the key is unknown or inactive.
+ *
+ * Uses the same prefix-lookup + constant-time hash comparison as
+ * {@link isValidApiKey} but returns the record instead of a boolean so the
+ * auth middleware can attach scopes and key identity to the request.
+ *
+ * @param rawKey - The raw key presented by the caller.
+ */
+export async function findRecordByRawKey(rawKey: string): Promise<ApiKeyRecord | undefined> {
+  const endTimer = authApiKeyLookupDurationSeconds.startTimer();
+
+  if (!rawKey || typeof rawKey !== 'string') {
+    endTimer({ outcome: 'failure' });
+    return undefined;
+  }
+
+  const prefix = rawKey.slice(0, PREFIX_LENGTH);
+  const candidates = await apiKeyRepository.findActiveByPrefix(prefix);
+
+  let matchedRecord: ApiKeyRecord | undefined;
+  for (const candidate of candidates) {
+    // Compare every candidate (do not early-return) so timing does not reveal
+    // which row, if any, matched within a colliding prefix bucket.
+    if (hashesMatch(hashKey(rawKey, candidate.salt), candidate.keyHash)) {
+      matchedRecord = candidate;
+    }
+  }
+  endTimer({ outcome: matchedRecord ? 'success' : 'failure' });
+  return matchedRecord;
+}
+
+/**
  * Retrieves the scopes for an API key by its ID.
  * Returns the scopes array or undefined if the key is not found.
  */

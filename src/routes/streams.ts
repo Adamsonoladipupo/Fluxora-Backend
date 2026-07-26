@@ -71,8 +71,15 @@ import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
+import { sendEarlyHints } from '../utils/earlyHints.js';
+import { canonicalizeBody } from '../middleware/idempotency.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
+import {
+  issueWriteFencePin,
+  shouldForcePrimaryFromHeaders,
+  WRITE_FENCE_HEADER,
+} from '../db/writeFencePin.js';
 import {
   CreateStreamSchema,
   parseBody,
@@ -100,6 +107,7 @@ import {
   resolveSseConnectionLimits,
   tryAcquireSseConnection,
 } from '../streams/sseConnectionLimiter.js';
+import { isEnabled as isFlagEnabled } from '../config/featureFlags.js';
 import {
   RedisIdempotencyStore,
   NoOpIdempotencyStore,
@@ -401,8 +409,8 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   };
 }
 
-function fingerprintInput(input: NormalizedCreateInput): string {
-  return crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
+export function fingerprintInput(input: NormalizedCreateInput): string {
+  return crypto.createHash('sha256').update(canonicalizeBody(input)).digest('hex');
 }
 
 /** Wrap DB errors so pool exhaustion surfaces as 503. */
@@ -479,7 +487,7 @@ streamsRouter.get(
   authenticateApiKey,
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id as string | undefined;
+    const requestId = req.correlationId as string | undefined;
 
     // Validate all query params in one pass via Zod
     const parsed = PaginationSchema.safeParse(req.query);
@@ -498,6 +506,13 @@ streamsRouter.get(
       throw serviceUnavailable('Stream list is temporarily unavailable. Retry when dependency health is restored.');
     }
 
+    // Read-your-writes: if the client echoes a valid, unexpired write-fence
+    // pin, route this read to the primary pool so the client sees its own
+    // recent write even if the replica is lagging.
+    const forcePrimary = shouldForcePrimaryFromHeaders(
+      req.headers as Record<string, string | string[] | undefined>,
+    );
+
     let result: { streams: Stream[]; hasMore: boolean; total?: number };
     const dbStart = process.hrtime.bigint();
     try {
@@ -510,6 +525,7 @@ streamsRouter.get(
         limit,
         cursor?.lastId,
         includeTotal,
+        { forcePrimary },
       );
       result = {
         streams: dbResult.streams.map(toApiStream),
@@ -531,14 +547,45 @@ streamsRouter.get(
 
     info('Listing streams', { limit, returned: pageStreams.length, hasMore, requestId });
 
+    // Send HTTP 103 Early Hints with Link header for next page, if available.
+    // This allows HTTP/2 clients to prefetch DNS/TLS for the next page URL
+    // while the server is preparing the current response. The hint is sent
+    // asynchronously and does not block the main response.
+    if (hasMore && nextCursor) {
+      const queryParams: Record<string, string> = {};
+      if (statusFilter) queryParams.status = statusFilter as string;
+      if (senderFilter) queryParams.sender = senderFilter;
+      if (recipientFilter) queryParams.recipient = recipientFilter;
+      if (include_total === 'true') queryParams.include_total = 'true';
+
+      sendEarlyHints(res, {
+        baseUrl: '/api/streams',
+        hasMore: true,
+        nextCursor,
+        queryParams,
+      });
+    }
+
     const response: {
       streams: Stream[];
       has_more: boolean;
       next_cursor: string | null;
       total?: number;
+      _meta?: { enhanced: boolean };
     } = { streams: pageStreams, has_more: hasMore, next_cursor: nextCursor };
 
     if (includeTotal && result!.total !== undefined) response.total = result!.total;
+
+    // Feature flag: streams_enhanced_response — add _meta field for opted-in requesters.
+    // The requester is identified by API key or IP; falls back to 'anonymous'.
+    // This is a zero-risk opt-in: if the flag is not configured, enhanced stays false.
+    const requesterId: string =
+      (req as unknown as Record<string, unknown>)['apiKey'] as string
+        ?? req.ip
+        ?? 'anonymous';
+    if (isFlagEnabled('streams_enhanced_response', requesterId)) {
+      response._meta = { enhanced: true };
+    }
 
     // Cache only when every stream on the page is in a terminal state.
     // An empty page is treated as all-terminal (nothing mutable present).
@@ -554,6 +601,138 @@ streamsRouter.get(
     } finally {
       const durationMs = Number(process.hrtime.bigint() - serializeStart) / 1e6;
       recordServerTimingPhase(res, 'serialize', durationMs);
+    }
+  }),
+);
+
+/**
+ * GET /api/streams/export
+ * Export streams in NDJSON format.
+ * Includes a resumption cursor in the final line if interrupted.
+ */
+streamsRouter.get(
+  '/export',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const requestId = req.id as string | undefined;
+    const resumeFrom = req.query.resume_from as string | undefined;
+    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
+    const limit = 100;
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-store');
+
+    try {
+      while (true) {
+        const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
+        
+        for (const record of dbResult.streams) {
+          res.write(JSON.stringify(toApiStream(record)) + '\n');
+        }
+
+        if (dbResult.streams.length > 0) {
+          cursor = { v: 1, lastId: dbResult.streams[dbResult.streams.length - 1]!.id };
+          res.write(JSON.stringify({ resumption_cursor: encodeCursor(cursor.lastId) }) + '\n');
+        }
+
+        if (!dbResult.hasMore) {
+          res.end();
+          break;
+        }
+      }
+      info('Stream export completed', { requestId });
+    } catch (err) {
+      warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
+      wrapDbError(err);
+    }
+  }),
+);
+
+/**
+ * GET /api/streams/export
+ * Export streams in NDJSON format.
+ * Includes a resumption cursor in the final line if interrupted.
+ */
+streamsRouter.get(
+  '/export',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const requestId = req.id as string | undefined;
+    const resumeFrom = req.query.resume_from as string | undefined;
+    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
+    const limit = 100;
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-store');
+
+    try {
+      while (true) {
+        const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
+        
+        for (const record of dbResult.streams) {
+          res.write(JSON.stringify(toApiStream(record)) + '\n');
+        }
+
+        if (dbResult.streams.length > 0) {
+          cursor = { v: 1, lastId: dbResult.streams[dbResult.streams.length - 1]!.id };
+          res.write(JSON.stringify({ resumption_cursor: encodeCursor(cursor.lastId) }) + '\n');
+        }
+
+        if (!dbResult.hasMore) {
+          res.end();
+          break;
+        }
+      }
+      info('Stream export completed', { requestId });
+    } catch (err) {
+      warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
+      wrapDbError(err);
+    }
+  }),
+);
+
+/**
+ * GET /api/streams/export
+ * Export streams in NDJSON format.
+ * Includes a resumption cursor in the final line if interrupted.
+ */
+streamsRouter.get(
+  '/export',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const requestId = req.id as string | undefined;
+    const resumeFrom = req.query.resume_from as string | undefined;
+    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
+    const limit = 100;
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-store');
+
+    try {
+      while (true) {
+        const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
+        
+        for (const record of dbResult.streams) {
+          res.write(JSON.stringify(toApiStream(record)) + '\n');
+        }
+
+        if (dbResult.streams.length > 0) {
+          cursor = { v: 1, lastId: dbResult.streams[dbResult.streams.length - 1]!.id };
+          res.write(JSON.stringify({ resumption_cursor: encodeCursor(cursor.lastId) }) + '\n');
+        }
+
+        if (!dbResult.hasMore) {
+          res.end();
+          break;
+        }
+      }
+      info('Stream export completed', { requestId });
+    } catch (err) {
+      warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
+      wrapDbError(err);
     }
   }),
 );
@@ -604,7 +783,7 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     if (!id) {
       throw notFound('Stream', '');
     }
@@ -699,7 +878,7 @@ streamsRouter.post(
   requireScope('streams:write'),
   requireIdempotencyKey,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id;
+    const requestId = req.correlationId;
     const correlationId = req.correlationId;
     const idempotencyKey = parseIdempotencyKeyHeader(req.header('Idempotency-Key'));
 
@@ -810,6 +989,21 @@ streamsRouter.post(
 
     streamsCreatedTotal.inc({ status: stream.status });
 
+    // Issue a read-your-writes fence pin.  The client must echo this token in
+    // the X-Fluxora-Write-Fence request header on its next GET /api/streams
+    // call to ensure the read is routed to the primary pool while the replica
+    // may still be lagging.  The pin expires after RYW_PIN_TTL_SECONDS (default
+    // 30 s) and is ignored if missing, malformed, or expired.
+    try {
+      res.set(WRITE_FENCE_HEADER, issueWriteFencePin());
+    } catch (pinErr) {
+      // Never let a pin-issuance failure break stream creation — log and skip.
+      warn('Failed to issue write-fence pin', {
+        error: pinErr instanceof Error ? pinErr.message : String(pinErr),
+        requestId,
+      });
+    }
+
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');
     res.status(201).json(responseEnvelope);
@@ -828,7 +1022,7 @@ streamsRouter.delete(
   requireScope('streams:write'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     if (!id) {
       throw notFound('Stream', '');
     }
@@ -876,7 +1070,7 @@ streamsRouter.patch(
   '/:id/status',
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     const { status: newStatus } = req.body ?? {};
 
     if (!id) {
@@ -933,7 +1127,7 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
 
     if (!id) {
       throw notFound('Stream', '');

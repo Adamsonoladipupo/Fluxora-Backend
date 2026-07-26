@@ -51,6 +51,7 @@ import {
   _resetStreams,
   setStreamListingDependencyState,
   setIdempotencyDependencyState,
+  fingerprintInput,
 } from '../../src/routes/streams.js';
 import { initializeConfig } from '../../src/config/env.js';
 import { generateToken } from '../../src/lib/auth.js';
@@ -341,6 +342,85 @@ describe('streams routes', () => {
     });
   });
 
+
+  // ── fingerprintInput() key-order stability ───────────────────────────────
+
+  describe('fingerprintInput()', () => {
+    it('produces the same digest regardless of NormalizedCreateInput key insertion order', () => {
+      const values = {
+        sender:        'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient:     'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+        depositAmount: '1000',
+        ratePerSecond: '10',
+        startTime:     1700000000,
+        endTime:       0,
+      };
+
+      // Object A: properties in canonical (sorted) order
+      const objA: Record<string, unknown> = {
+        depositAmount: values.depositAmount,
+        endTime:       values.endTime,
+        ratePerSecond: values.ratePerSecond,
+        recipient:     values.recipient,
+        sender:        values.sender,
+        startTime:     values.startTime,
+      };
+
+      // Object B: properties in reverse order
+      const objB: Record<string, unknown> = {
+        startTime:     values.startTime,
+        sender:        values.sender,
+        recipient:     values.recipient,
+        ratePerSecond: values.ratePerSecond,
+        endTime:       values.endTime,
+        depositAmount: values.depositAmount,
+      };
+
+      // Object C: properties in insertion-order (as returned by normalizeCreateInput)
+      const objC: Record<string, unknown> = {
+        sender:        values.sender,
+        recipient:     values.recipient,
+        depositAmount: values.depositAmount,
+        ratePerSecond: values.ratePerSecond,
+        startTime:     values.startTime,
+        endTime:       values.endTime,
+      };
+
+      const fpA = fingerprintInput(objA as Parameters<typeof fingerprintInput>[0]);
+      const fpB = fingerprintInput(objB as Parameters<typeof fingerprintInput>[0]);
+      const fpC = fingerprintInput(objC as Parameters<typeof fingerprintInput>[0]);
+
+      expect(fpA).toBe(fpB);
+      expect(fpB).toBe(fpC);
+    });
+
+    it('produces different digests for different input values', async () => {
+      const base: Parameters<typeof fingerprintInput>[0] = {
+        sender:        'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient:     'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+        depositAmount: '1000',
+        ratePerSecond: '10',
+        startTime:     1700000000,
+        endTime:       0,
+      };
+
+      const modified = { ...base, depositAmount: '9999' };
+      expect(fingerprintInput(base)).not.toBe(fingerprintInput(modified));
+    });
+
+    it('returns a 64-character hex string', () => {
+      const input: Parameters<typeof fingerprintInput>[0] = {
+        sender:        'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient:     'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+        depositAmount: '1000',
+        ratePerSecond: '10',
+        startTime:     1700000000,
+        endTime:       0,
+      };
+      const fp = fingerprintInput(input);
+      expect(fp).toMatch(/^[a-f0-9]{64}$/);
+    });
+  });
 
   // ── POST /api/streams — idempotency ──────────────────────────────────────
 
