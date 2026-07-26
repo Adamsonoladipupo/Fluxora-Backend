@@ -223,6 +223,13 @@ export const RETENTION_SCHEDULE: RetentionRule[] = [
       'Mirrors immutable on-chain state. Retained as long as the contract exists; deletion would create inconsistency with Horizon.',
   },
   {
+    category: 'Stream address PII',
+    retentionDays: 365,
+    storageLayer: 'PostgreSQL — streams',
+    rationale:
+      'Sender and recipient addresses are sensitive pseudonymous identifiers. After 365 days these fields are redacted in place unless the stream is under legal hold.',
+  },
+  {
     category: 'HTTP request metadata',
     retentionDays: 0,
     storageLayer: 'ephemeral (process memory)',
@@ -240,8 +247,7 @@ export const RETENTION_SCHEDULE: RetentionRule[] = [
     category: 'Authentication tokens',
     retentionDays: 0,
     storageLayer: 'ephemeral (process memory)',
-    rationale:
-      'Tokens are validated in-flight and never persisted or logged.',
+    rationale: 'Tokens are validated in-flight and never persisted or logged.',
   },
 ];
 
@@ -270,6 +276,16 @@ export const PURGEABLE_RETENTION_SCHEDULE: PurgeableRetentionRule[] = [
     table: 'audit_logs',
     ageColumn: 'timestamp',
     purgeAction: 'delete',
+  },
+  {
+    category: 'Stream address PII',
+    retentionDays: 365,
+    storageLayer: 'PostgreSQL — streams',
+    rationale:
+      'Sender and recipient addresses are sensitive pseudonymous identifiers. After 365 days these fields are redacted in place unless the stream is under legal hold.',
+    table: 'streams',
+    ageColumn: 'created_at',
+    purgeAction: 'redact',
   },
   {
     category: 'Webhook outbox (processed)',
@@ -321,7 +337,7 @@ export const TRUST_BOUNDARIES: TrustBoundary[] = [
     ],
     denied: [
       'Access admin endpoints',
-      'View other partners\' stream data (future: row-level isolation)',
+      "View other partners' stream data (future: row-level isolation)",
       'View raw logs or internal diagnostics',
     ],
   },
@@ -333,10 +349,7 @@ export const TRUST_BOUNDARIES: TrustBoundary[] = [
       'View aggregated metrics and health details',
       'Trigger manual data reconciliation',
     ],
-    denied: [
-      'Bypass PII redaction in API responses',
-      'Export raw PII without audit trail',
-    ],
+    denied: ['Bypass PII redaction in API responses', 'Export raw PII without audit trail'],
   },
   {
     actor: 'Internal worker',

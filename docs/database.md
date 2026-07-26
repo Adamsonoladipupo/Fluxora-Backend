@@ -4,6 +4,22 @@
 
 Fluxora Backend uses a `pg.Pool` (node-postgres) for all database access. The pool is configured via environment variables and includes proactive exhaustion detection to prevent unbounded request queuing.
 
+## Typed Row Mapping
+
+`pg.Pool.query<T>()` / `PoolClient.query<T>()` constrain `T` to `QueryResultRow` (an index signature). **Do not** pass bare domain interfaces (`ReplayCursor`, `ContractEvent`, `VacuumRow`, `StreamRecord`, …) as that generic — they fail `tsc` with `TS2344`.
+
+**Required pattern** (already used in `streamRepository`, `apiKeyRepository`, `dlqRepository`):
+
+1. Query with `Record<string, unknown>` (or omit the generic).
+2. Map each row through an explicit `rowToX()` helper into the domain type.
+
+```ts
+const result = await client.query<Record<string, unknown>>(sql, params);
+return result.rows.map(rowToReplayCursor);
+```
+
+Full convention: [`src/db/repositories/README.md`](../src/db/repositories/README.md).
+
 ## Configuration
 
 | Variable | Default | Description |

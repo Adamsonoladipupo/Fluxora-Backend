@@ -20,6 +20,12 @@ import type { ApiKeyRecord } from '../types.js';
 
 /** Map a raw pg row to a typed {@link ApiKeyRecord}. */
 function rowToRecord(row: Record<string, unknown>): ApiKeyRecord {
+  const scopes = Array.isArray(row['scopes'])
+    ? (row['scopes'] as string[])
+    : typeof row['scopes'] === 'string'
+      ? JSON.parse(row['scopes'] as string)
+      : ['streams:read', 'streams:write'];
+
   return {
     id:        row['id']     as string,
     name:      row['name']   as string,

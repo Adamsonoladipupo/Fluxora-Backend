@@ -40,7 +40,7 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
-  const requestId = req.correlationId ?? req.id ?? (res.locals['requestId'] as string | undefined);
+  const requestId = req.correlationId ?? (res.locals['requestId'] as string | undefined);
 
   // Ensure X-Request-ID is present even if correlationId middleware ran before
   // the route that set it, or if something cleared it.
