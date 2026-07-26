@@ -53,12 +53,35 @@ import {
   setIdempotencyDependencyState,
   fingerprintInput,
   enforceStreamScope,
+  getFeatureFlagRequesterId,
 } from '../../src/routes/streams.js';
 import { initializeConfig } from '../../src/config/env.js';
 import { generateToken } from '../../src/lib/auth.js';
+import type { Request } from 'express';
 
 // Initialize config before importing anything that needs it
 initializeConfig();
+
+describe('getFeatureFlagRequesterId', () => {
+  it('prefers authenticated API key id over header and IP', () => {
+    const req = {
+      keyId: 'key-record-1',
+      headers: { 'x-api-key': 'raw-key' },
+      ip: '203.0.113.10',
+    } as unknown as Request;
+
+    expect(getFeatureFlagRequesterId(req)).toBe('key:key-record-1');
+  });
+
+  it('falls back to raw API key header before IP', () => {
+    const req = {
+      headers: { 'x-api-key': 'raw-key' },
+      ip: '203.0.113.10',
+    } as unknown as Request;
+
+    expect(getFeatureFlagRequesterId(req)).toBe('api-key:raw-key');
+  });
+});
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
