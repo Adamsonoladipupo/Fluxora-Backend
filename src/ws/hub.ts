@@ -1029,7 +1029,12 @@ export class StreamHub extends EventEmitter {
       return;
     }
 
-    ws.send(message);
+    try {
+      ws.send(message);
+    } catch {
+      this.metrics.droppedMessages += safeEvents.length;
+      return;
+    }
     this.metrics.sentMessages++;
 
     const state = this.clients.get(ws);
@@ -1094,7 +1099,13 @@ export class StreamHub extends EventEmitter {
         continue;
       }
 
-      ws.send(message);
+      try {
+        ws.send(message);
+      } catch {
+        // If send throws (e.g. a race with concurrent terminate), skip this
+        // client without counting it as sent or crashing the broadcast.
+        continue;
+      }
       this.metrics.sentMessages++;
       sent++;
 
