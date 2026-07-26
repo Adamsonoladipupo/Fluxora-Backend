@@ -268,20 +268,15 @@ export function getApiKeyFromRequest(
 }
 
 /**
- * Resolves a raw API key to its full {@link ApiKeyRecord} (including scopes),
- * or `undefined` if the key is unknown or inactive.
+ * Retrieves an active key record by raw API key value.
+ * Used for authentication to get the full record (including scopes).
+ * Exposed for middleware/auth use.
  *
- * Uses the same prefix-lookup + constant-time hash comparison as
- * {@link isValidApiKey} but returns the record instead of a boolean so the
- * auth middleware can attach scopes and key identity to the request.
- *
- * @param rawKey - The raw key presented by the caller.
+ * Resolves candidate active rows by the indexed key prefix (O(log n)) and then
+ * performs constant-time comparison against candidate hashes.
  */
-export async function findRecordByRawKey(rawKey: string): Promise<ApiKeyRecord | undefined> {
-  const endTimer = authApiKeyLookupDurationSeconds.startTimer();
-
+export async function getApiKeyRecord(rawKey: string): Promise<ApiKeyRecord | undefined> {
   if (!rawKey || typeof rawKey !== 'string') {
-    endTimer({ outcome: 'failure' });
     return undefined;
   }
 
@@ -290,62 +285,10 @@ export async function findRecordByRawKey(rawKey: string): Promise<ApiKeyRecord |
 
   let matchedRecord: ApiKeyRecord | undefined;
   for (const candidate of candidates) {
-    // Compare every candidate (do not early-return) so timing does not reveal
-    // which row, if any, matched within a colliding prefix bucket.
     if (hashesMatch(hashKey(rawKey, candidate.salt), candidate.keyHash)) {
       matchedRecord = candidate;
     }
   }
-  endTimer({ outcome: matchedRecord ? 'success' : 'failure' });
+
   return matchedRecord;
-}
-
-/**
- * Retrieves the scopes for an API key by its ID.
- * Returns the scopes array or undefined if the key is not found.
- */
-export function getApiKeyScopes(id: string): string[] | undefined {
-  const record = store.get(id);
-  return record?.scopes;
-}
-
-/**
- * Validates if an API key has a specific scope.
- * Returns true if the keyxists, is active, and has the required scope.
- */
-export function hasScope(keyId: string, requiredScope: string): boolean {
-  const record = store.get(keyId);
-  if (!record || !record.active) return false;
-  return record.scopes.includes(requiredScope);
-}
-
-/**
- * Retrieves a key record by raw API key value.
- * Used for authentication to get the full record (including scopes).
- * Exposed for middleware/auth use.
- */
-export function getApiKeyRecord(rawKey: string): ApiKeyRecord | undefined {
-  if (!rawKey) return undefined;
-
-  const hash = sha256hex(rawKey);
-  const hashBuf = Buffer.from(hash, 'hex');
-
-  for (const record of store.values()) {
-    if (!record.active) continue;
-    try {
-      const storedBuf = Buffer.from(record.keyHash, 'hex');
-      if (storedBuf.length === hashBuf.length && timingSafeEqual(storedBuf, hashBuf)) {
-        return record;
-      }
-    } catch {
-      // length mismatch — skip
-    }
-  }
-
-  return undefined;
-}
-
-/** Exposed for tests only — clears the in-memory store. */
-export function _resetApiKeyStoreForTest(): void {
-  store.clear();
 }
