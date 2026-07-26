@@ -127,6 +127,39 @@ describe('POST /internal/webhooks/receive — remains public (no admin token)', 
   });
 });
 
+// ── Secret-based auth regression tests ──────────────────────────────────────
+
+describe('Protected webhook routes do not trust caller-supplied secrets', () => {
+  it('rejects /process-outbox when only a bogus secret is supplied', async () => {
+    const res = await request(app)
+      .post(`${BASE}/process-outbox`)
+      .set('Content-Type', 'application/json')
+      .query({ secret: 'not-the-admin-key' })
+      .send({});
+
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects /retry when only a bogus secret is supplied', async () => {
+    const res = await request(app)
+      .post(`${BASE}/retry`)
+      .set('Content-Type', 'application/json')
+      .query({ secret: 'not-the-admin-key' })
+      .send({ secret: 'not-the-admin-key' });
+
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects /dlq/:dlqId/retry when only a bogus secret is supplied', async () => {
+    const res = await request(app)
+      .post(`${BASE}/dlq/nonexistent/retry`)
+      .set('Content-Type', 'application/json')
+      .send({ secret: 'not-the-admin-key' });
+
+    expect(res.status).toBe(401);
+  });
+});
+
 // ── Auth gate matrix ──────────────────────────────────────────────────────────
 //
 // For each protected endpoint we verify:

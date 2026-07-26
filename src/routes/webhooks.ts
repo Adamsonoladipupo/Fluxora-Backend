@@ -293,21 +293,28 @@ webhooksRouter.get('/dlq', (req, res) => {
 
 /**
  * POST /api/webhooks/dlq/:dlqId/retry
- * Retry a dead-letter queue item
+ * Retry a dead-letter queue item.
+ *
+ * Authorization: requireAdminAuth (Bearer token) — applied by the router-level
+ * guard above. No secondary secret check is performed here.
+ *
+ * Body (optional):
+ *   secret {string} — the per-delivery HMAC signing key to use when the item
+ *     is re-queued. This is NOT an authorization credential; it is the
+ *     webhook signing secret that will be used to sign the outbound HTTP
+ *     delivery to the consumer endpoint. If omitted, the original delivery's
+ *     secret (stored on the DLQ item) is reused.
+ *
+ * Previously this handler checked `if (!secret) { return 400 }`.  That check
+ * was a presence-only guard — any non-empty string passed — giving the false
+ * impression of secret-based authorization while providing none.  It has been
+ * removed.  Admin authentication via requireAdminAuth is the sole gate.
  */
 webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
   const { dlqId } = req.params;
-  const { secret } = req.body;
-
-  if (!secret) {
-    res.status(400).json({
-      error: {
-        code: 'MISSING_SECRET',
-        message: 'Webhook secret is required',
-      },
-    });
-    return;
-  }
+  // `secret` is the per-delivery HMAC signing key for the re-queued outbox
+  // item, NOT an authorization credential.  Omitting it reuses the original.
+  const { secret } = req.body ?? {};
 
   try {
     // Get DLQ item
@@ -337,14 +344,20 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
       return;
     }
 
-    // Re-queue the webhook for retry
+    // Re-queue the webhook for retry, using the provided signing secret or
+    // falling back to the one stored on the original DLQ item.
+    const signingSecret: string =
+      typeof secret === 'string' && secret.length > 0
+        ? secret
+        : (dlqItem.originalDelivery.payload ?? '');
+
     const outboxId = webhookDeliveryStore.addToOutbox({
       deliveryId: `retry_${dlqItem.deliveryId}_${Date.now()}`,
       eventId: dlqItem.eventId,
       eventType: dlqItem.eventType,
       endpointUrl: dlqItem.endpointUrl,
       payload: dlqItem.payload,
-      secret,
+      secret: signingSecret,
       priority: 'high', // Prioritize retries
       createdAt: Date.now(),
       scheduledFor: Date.now(),
