@@ -21,6 +21,8 @@
  *   ✓ writeSkippedAuditEvent failure — swallowed, batch continues
  *   ✓ rowid fallback — extracts primary key from rowid column
  *   ✓ JSON.stringify fallback — no id/rowid columns
+ *   ✓ Dry-run write isolation (#832) — table store unchanged; no PURGE_INITIATED;
+ *     PURGE_SKIPPED_LEGAL_HOLD in both modes; real run deletes unheld rows
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -782,5 +784,308 @@ describe('runRetentionPurge() — SQL structure', () => {
     expect(auditInsert).toBeDefined();
     // params: [timestamp, action, resource_type, resource_id, correlation_id, meta]
     expect(auditInsert!.params[1]).toBe('PURGE_INITIATED');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 17. Dry-run write isolation (#832)
+//
+// Proves at the *data* level (not just query-string inspection) that dryRun
+// leaves every seeded row untouched, while a real run removes them — and that
+// PURGE_INITIATED is dry-run–scoped while PURGE_SKIPPED_LEGAL_HOLD fires in
+// both modes.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * In-memory table store that DELETE/UPDATE mutate and that tests can
+ * re-query after `runRetentionPurge` — mirrors "SELECT the table again".
+ */
+function makeTableStore(initial: Record<string, unknown>[]) {
+  const store = new Map<string, Record<string, unknown>>();
+  for (const r of initial) {
+    store.set(String(r.id), { ...r });
+  }
+  return {
+    /** Snapshot of current primary keys (stable order). */
+    ids(): string[] {
+      return [...store.keys()].sort();
+    },
+    has(id: string): boolean {
+      return store.has(id);
+    },
+    get(id: string): Record<string, unknown> | undefined {
+      return store.get(id);
+    },
+    size(): number {
+      return store.size;
+    },
+    /** All current rows — used by the stateful SELECT. */
+    all(): Record<string, unknown>[] {
+      return [...store.values()];
+    },
+    delete(id: string): void {
+      store.delete(id);
+    },
+    redact(id: string): void {
+      const existing = store.get(id);
+      if (existing) {
+        store.set(id, {
+          ...existing,
+          meta: { purged: true },
+          correlation_id: null,
+        });
+      }
+    },
+  };
+}
+type TableStore = ReturnType<typeof makeTableStore>;
+
+/**
+ * Mock client backed by a {@link TableStore}.
+ * SELECT (candidate fetch) returns the current store contents once per connect
+ * cycle then an empty batch so the job's drain loop terminates when
+ * batchSize > remaining rows (same as production dry-run with a short table).
+ * DELETE / UPDATE mutate the store so post-run assertions see real data effects.
+ */
+function makeStatefulClient(store: TableStore) {
+  const queries: MockQuery[] = [];
+  let selectCalls = 0;
+
+  const client = {
+    queries,
+    store,
+    released: false,
+    query: vi.fn(async (sql: string, params: unknown[] = []) => {
+      const trimmed = sql.trim();
+      queries.push({ sql: trimmed, params });
+
+      if (/^\s*SELECT/i.test(trimmed)) {
+        selectCalls += 1;
+        // First SELECT of this client connection → current table snapshot.
+        // Subsequent SELECTs → empty (job expects drain when batch < batchSize).
+        if (selectCalls === 1) {
+          const batch = store.all();
+          return { rows: batch, rowCount: batch.length };
+        }
+        return { rows: [], rowCount: 0 };
+      }
+
+      if (/^\s*DELETE/i.test(trimmed)) {
+        const id = String(params[0]);
+        store.delete(id);
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (/^\s*UPDATE/i.test(trimmed)) {
+        const id = String(params[0]);
+        store.redact(id);
+        return { rows: [], rowCount: 1 };
+      }
+
+      return { rows: [], rowCount: 0 };
+    }),
+    release: vi.fn(() => {
+      client.released = true;
+    }),
+  };
+  return client;
+}
+
+/** Empty client for subsequent schedule rules after the first. */
+function emptyRuleClients(count: number): MockClient[] {
+  return Array.from({ length: count }, () => makeMockClient({ rows: [[]] }));
+}
+
+describe('runRetentionPurge() — dry-run write isolation (#832)', () => {
+  beforeEach(() => {
+    vi.mocked(recordAuditEventToDb).mockClear();
+    vi.mocked(recordAuditEventToDb).mockResolvedValue({});
+  });
+
+  it('dryRun:true leaves every seeded row present when re-queried from the table store', async () => {
+    const seeded = [
+      row({ id: 'keep-1', legal_hold: false }),
+      row({ id: 'keep-2', legal_hold: false }),
+      row({ id: 'keep-3', legal_hold: false }),
+    ];
+    const store = makeTableStore(seeded);
+    const beforeIds = store.ids();
+    const beforeSize = store.size();
+
+    const c0 = makeStatefulClient(store);
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+    const result = await runRetentionPurge(
+      opts([c0 as unknown as MockClient, ...rest], { dryRun: true, batchSize: 10 })
+    );
+
+    // Summary still reports what *would* be purged.
+    expect(result.results[0].dryRun).toBe(true);
+    expect(result.results[0].rowsPurged).toBe(3);
+    expect(result.totalRowsPurged).toBe(3);
+
+    // Data-level isolation: re-query the table — every seeded id is still there.
+    expect(store.size()).toBe(beforeSize);
+    expect(store.ids()).toEqual(beforeIds);
+    for (const id of beforeIds) {
+      expect(store.has(id)).toBe(true);
+    }
+
+    // No mutating SQL was issued.
+    expect(c0.queries.filter((q) => /^\s*DELETE/i.test(q.sql))).toHaveLength(0);
+    expect(c0.queries.filter((q) => /^\s*UPDATE/i.test(q.sql))).toHaveLength(0);
+  });
+
+  it('dryRun:false actually removes seeded rows from the table store', async () => {
+    const seeded = [
+      row({ id: 'gone-1', legal_hold: false }),
+      row({ id: 'gone-2', legal_hold: false }),
+    ];
+    const store = makeTableStore(seeded);
+    expect(store.size()).toBe(2);
+
+    const c0 = makeStatefulClient(store);
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+    const result = await runRetentionPurge(
+      opts([c0 as unknown as MockClient, ...rest], { dryRun: false, batchSize: 10 })
+    );
+
+    expect(result.results[0].dryRun).toBe(false);
+    expect(result.results[0].rowsPurged).toBe(2);
+
+    // Symmetric non-dry-run proof: table is empty of those ids.
+    expect(store.size()).toBe(0);
+    expect(store.has('gone-1')).toBe(false);
+    expect(store.has('gone-2')).toBe(false);
+    expect(c0.queries.filter((q) => /^\s*DELETE/i.test(q.sql))).toHaveLength(2);
+  });
+
+  it('does NOT write PURGE_INITIATED audit events in dry-run mode', async () => {
+    const store = makeTableStore([row({ id: 'a1' }), row({ id: 'a2' })]);
+    const c0 = makeStatefulClient(store);
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+
+    await runRetentionPurge(
+      opts([c0 as unknown as MockClient, ...rest], {
+        dryRun: true,
+        correlationId: 'dry-run-no-purge-audit',
+      })
+    );
+
+    const purgeInitiated = c0.queries.filter(
+      (q) =>
+        /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
+    );
+    expect(purgeInitiated).toHaveLength(0);
+  });
+
+  it('DOES write PURGE_INITIATED audit events when dryRun is false', async () => {
+    const store = makeTableStore([row({ id: 'a1' })]);
+    const c0 = makeStatefulClient(store);
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+
+    await runRetentionPurge(
+      opts([c0 as unknown as MockClient, ...rest], {
+        dryRun: false,
+        correlationId: 'real-purge-audit',
+      })
+    );
+
+    const purgeInitiated = c0.queries.filter(
+      (q) =>
+        /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
+    );
+    expect(purgeInitiated.length).toBeGreaterThanOrEqual(1);
+    expect(purgeInitiated[0].params).toContain('real-purge-audit');
+  });
+
+  it('writes PURGE_SKIPPED_LEGAL_HOLD in dry-run mode without deleting held or unheld rows', async () => {
+    const seeded = [
+      row({ id: 'held-dry', legal_hold: true }),
+      row({ id: 'free-dry', legal_hold: false }),
+    ];
+    const store = makeTableStore(seeded);
+    const c0 = makeStatefulClient(store);
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+
+    const result = await runRetentionPurge(
+      opts([c0 as unknown as MockClient, ...rest], {
+        dryRun: true,
+        correlationId: 'dry-hold-skip',
+      })
+    );
+
+    expect(result.totalRowsSkipped).toBe(1);
+    expect(result.totalRowsPurged).toBe(1); // would-be purge count for free-dry
+    expect(store.has('held-dry')).toBe(true);
+    expect(store.has('free-dry')).toBe(true); // dry-run must not delete free rows either
+    expect(c0.queries.filter((q) => /^\s*DELETE/i.test(q.sql))).toHaveLength(0);
+
+    expect(recordAuditEventToDb).toHaveBeenCalledWith(
+      'PURGE_SKIPPED_LEGAL_HOLD',
+      expect.any(String),
+      'held-dry',
+      'dry-hold-skip',
+      expect.objectContaining({ reason: 'legal_hold = TRUE' })
+    );
+
+    // No PURGE_INITIATED in dry-run even when some rows would be purged.
+    const purgeInitiated = c0.queries.filter(
+      (q) =>
+        /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
+    );
+    expect(purgeInitiated).toHaveLength(0);
+  });
+
+  it('writes PURGE_SKIPPED_LEGAL_HOLD in real mode and only deletes unheld rows', async () => {
+    const seeded = [
+      row({ id: 'held-real', legal_hold: true }),
+      row({ id: 'free-real', legal_hold: false }),
+    ];
+    const store = makeTableStore(seeded);
+    const c0 = makeStatefulClient(store);
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+
+    const result = await runRetentionPurge(
+      opts([c0 as unknown as MockClient, ...rest], {
+        dryRun: false,
+        correlationId: 'real-hold-skip',
+      })
+    );
+
+    expect(result.totalRowsSkipped).toBe(1);
+    expect(result.totalRowsPurged).toBe(1);
+
+    // Held row survives; free row is gone.
+    expect(store.has('held-real')).toBe(true);
+    expect(store.has('free-real')).toBe(false);
+
+    expect(recordAuditEventToDb).toHaveBeenCalledWith(
+      'PURGE_SKIPPED_LEGAL_HOLD',
+      expect.any(String),
+      'held-real',
+      'real-hold-skip',
+      expect.objectContaining({ reason: 'legal_hold = TRUE' })
+    );
+
+    const purgeInitiated = c0.queries.filter(
+      (q) =>
+        /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
+    );
+    expect(purgeInitiated.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('never issues UPDATE (redact) mutations under dryRun either', async () => {
+    // Current schedule is delete-only, but guard against a future redact rule
+    // silently mutating via UPDATE when dryRun is true.
+    const store = makeTableStore([row({ id: 'r1' })]);
+    const c0 = makeStatefulClient(store);
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+
+    await runRetentionPurge(
+      opts([c0 as unknown as MockClient, ...rest], { dryRun: true })
+    );
+
+    expect(c0.queries.filter((q) => /^\s*UPDATE/i.test(q.sql))).toHaveLength(0);
+    expect(store.has('r1')).toBe(true);
   });
 });
