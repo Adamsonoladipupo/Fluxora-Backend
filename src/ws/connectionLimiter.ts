@@ -1,8 +1,10 @@
-import type { IncomingMessage } from 'node:http';
 import { logger } from '../lib/logger.js';
 import type { BanStore, BanCheckResult } from '../redis/banStore.js';
 import { createBanStore } from '../redis/banStore.js';
 import type { RedisClient } from '../redis/client.js';
+import { getClientIp } from '../lib/ipExtraction.js';
+
+export { getClientIp };
 
 // In-memory state (non-ban state)
 const connectionCounts = new Map<string, number>();
@@ -24,45 +26,6 @@ export function setBanStore(store: BanStore): void {
  */
 export function getBanStore(): BanStore {
   return banStore;
-}
-
-/**
- * Extracts the client IP address from the request, respecting X-Forwarded-For
- * only if the remote address is a trusted proxy.
- *
- * TRUST BOUNDARY (Security Critical):
- * - The IP returned by this function is used as the identity for connection
- *   limiting and abuse banning (passed to HybridBanStore/RedisBanStore).
- * - X-Forwarded-For is ONLY trusted when the immediate peer (req.socket.remoteAddress)
- *   matches an IP in WS_TRUSTED_PROXIES environment variable.
- * - If the request comes from an untrusted IP, X-Forwarded-For is ignored and
- *   the socket's remoteAddress is used directly.
- * - This prevents IP spoofing via forged headers when the proxy configuration
- *   is missing or misconfigured.
- * - Operators MUST configure WS_TRUSTED_PROXIES to match their actual
- *   load balancer/proxy IPs (e.g., "10.0.0.1,10.0.0.2,::1").
- *
- * The resulting IP is passed to sanitiseIp() in banStore.ts which hashes it
- * with SHA-256 to prevent key collisions from long/spoofed inputs (#833).
- */
-export function getClientIp(req: IncomingMessage): string {
-  const remoteAddress = req.socket.remoteAddress || 'unknown';
-  const xForwardedFor = req.headers['x-forwarded-for'];
-  const trustedProxies = new Set(
-    (process.env.WS_TRUSTED_PROXIES || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
-  );
-
-  if (xForwardedFor && trustedProxies.has(remoteAddress)) {
-    const ips = (Array.isArray(xForwardedFor) ? xForwardedFor[0] : xForwardedFor)
-      .split(',')
-      .map((s) => s.trim());
-    return ips[0] || remoteAddress;
-  }
-
-  return remoteAddress;
 }
 
 /**

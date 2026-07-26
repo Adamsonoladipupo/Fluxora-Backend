@@ -16,7 +16,7 @@ import type {
   DLQReasonCode,
 } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
-import { webhookDeliveryStore } from './store.js';
+import { webhookDeliveryStore } from './storeFactory.js';
 import { computeWebhookSignature } from './signature.js';
 import {
   calculateNextRetryTime,

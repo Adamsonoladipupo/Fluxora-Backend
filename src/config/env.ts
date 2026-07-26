@@ -223,6 +223,12 @@ export const EnvSchema = z.object({
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
   ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
 
+  /** OIDC issuer base URL, e.g. https://accounts.example.com. JWKS is fetched
+   *  from `${OIDC_ISSUER_URL}/.well-known/jwks.json`. Unset disables OIDC login. */
+  OIDC_ISSUER_URL: optionalUrlString('OIDC_ISSUER_URL'),
+  /** Expected `aud` (client_id) claim on OIDC ID tokens. */
+  OIDC_AUDIENCE: optionalString('OIDC_AUDIENCE'),
+
   MAX_REQUEST_SIZE: z.preprocess(
     byteSizeToNumber,
     z.number().int('MAX_REQUEST_SIZE must resolve to whole bytes').positive('MAX_REQUEST_SIZE must be positive'),
@@ -274,6 +280,7 @@ export const EnvSchema = z.object({
   ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
   WS_AUTH_REQUIRED: booleanEnv().default(false),
   SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
+  SSE_MAX_CONNECTIONS_PER_API_KEY: integerEnv('SSE_MAX_CONNECTIONS_PER_API_KEY', 1, 100_000).default(50),
   SSE_MAX_GLOBAL_CONNECTIONS: integerEnv('SSE_MAX_GLOBAL_CONNECTIONS', 1, 100_000).default(1000),
   SSE_MAX_CONNECTION_DURATION_MS: integerEnv('SSE_MAX_CONNECTION_DURATION_MS', 1, 86_400_000).default(30 * 60 * 1000),
   SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
@@ -454,6 +461,11 @@ export interface Config {
   apiKeyPepper?: string | undefined;
   indexerWorkerToken: string;
 
+  /** OIDC issuer base URL. Undefined means OIDC login is disabled. */
+  oidcIssuerUrl?: string | undefined;
+  /** Expected `aud` (client_id) claim for OIDC ID tokens. */
+  oidcAudience?: string | undefined;
+
   maxRequestSizeBytes: number;
   maxJsonDepth: number;
   requestTimeoutMs: number;
@@ -488,6 +500,7 @@ export interface Config {
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
   sseMaxConnectionsPerIp: number;
+  sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
   sseMaxConnectionDurationMs: number;
   sseRetryAfterSeconds: number;
@@ -650,6 +663,9 @@ function toConfig(env: ParsedEnv): Config {
     apiKeyPepper: env.API_KEY_PEPPER,
     indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
 
+    oidcIssuerUrl: env.OIDC_ISSUER_URL,
+    oidcAudience: env.OIDC_AUDIENCE,
+
     maxRequestSizeBytes: env.MAX_REQUEST_SIZE,
     maxJsonDepth: env.MAX_JSON_DEPTH,
     requestTimeoutMs: env.REQUEST_TIMEOUT_MS,
@@ -686,6 +702,7 @@ function toConfig(env: ParsedEnv): Config {
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
+    sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
     sseMaxConnectionDurationMs: env.SSE_MAX_CONNECTION_DURATION_MS,
     sseRetryAfterSeconds: env.SSE_RETRY_AFTER_SECONDS,

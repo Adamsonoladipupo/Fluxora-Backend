@@ -6,6 +6,7 @@ import { InMemoryStore, SlidingWindowStore, HybridStore } from '../redis/rateLim
 import { createRedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 import { rateLimitRejectedTotal, rateLimitRedisErrorsTotal } from '../metrics.js';
+import { getClientIp } from '../ws/connectionLimiter.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -101,10 +102,7 @@ export function extractClientIdentifier(req: Request): {
   if (typeof apiKey === 'string' && apiKey.length > 0) {
     return { identifier: apiKey, identifierType: 'apiKey' };
   }
-  const ip =
-    (req as Request & { ip?: string }).ip ??
-    req.socket.remoteAddress ??
-    'unknown';
+  const ip = getClientIp(req);
   return { identifier: ip, identifierType: 'ip' };
 }
 

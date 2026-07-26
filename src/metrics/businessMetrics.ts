@@ -172,6 +172,23 @@ export const sseSubscriberErrorsTotal =
     registers: [registry],
   });
 
+/**
+ * Counter for SSE connections dropped due to backpressure (buffer overflow).
+ *
+ * Fires when a slow consumer's per-connection buffer exceeds
+ * `SSE_MAX_BUFFERED_EVENTS` and the connection is severed to prevent
+ * unbounded memory growth (DoS vector).
+ *
+ * @security No payloads, IPs, or PII. Bounded cardinality (single series).
+ */
+export const sseBackpressureDropsTotal =
+  (registry.getSingleMetric('fluxora_sse_backpressure_drops_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_sse_backpressure_drops_total',
+    help: 'Total number of SSE connections dropped due to per-connection buffer overflow (slow consumer backpressure)',
+    registers: [registry],
+  });
+
 
 /**
  * Webhook outbox backlog gauge.
