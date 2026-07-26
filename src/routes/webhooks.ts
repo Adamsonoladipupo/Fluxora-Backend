@@ -1,6 +1,10 @@
 /**
  * Enhanced webhook delivery and management routes
  * Includes outbox, dead-letter queue, and circuit breaker endpoints
+ *
+ * Authentication model:
+ *   POST /receive  — public, HMAC-verified by external webhook senders
+ *   all other routes — require a valid admin Bearer token (requireAdminAuth)
  */
 
 import express from 'express';
@@ -9,10 +13,16 @@ import { webhookService } from '../webhooks/service.js';
 import { webhookDeliveryStore } from '../webhooks/store.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import { verifyWebhookSignature } from '../webhooks/signature.js';
+import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { logger } from '../lib/logger.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 
 export const webhooksRouter = express.Router();
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PUBLIC endpoint — no admin token required; verified by HMAC signature only.
+// Must be registered BEFORE the requireAdminAuth guard below.
+// ──────────────────────────────────────────────────────────────────────────────
 
 /**
  * POST /internal/webhooks/receive
@@ -73,6 +83,17 @@ webhooksRouter.post(
   },
 );
 
+// ──────────────────────────────────────────────────────────────────────────────
+// ADMIN guard — every route registered after this line requires a valid
+// Bearer token matching ADMIN_API_KEY.  This mirrors the pattern used by
+// /api/admin (adminRouter.use(requireAdminAuth)).
+// ──────────────────────────────────────────────────────────────────────────────
+webhooksRouter.use(requireAdminAuth);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Protected endpoints below
+// ──────────────────────────────────────────────────────────────────────────────
+
 /**
  * POST /api/webhooks/queue
  * Queue a webhook delivery for reliable processing
@@ -88,6 +109,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
           message: 'Missing required fields: event, endpointUrl, secret',
         },
       });
+      return;
     }
 
     // Add to outbox for reliable processing
@@ -284,6 +306,7 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
         message: 'Webhook secret is required',
       },
     });
+    return;
   }
 
   try {
@@ -311,6 +334,7 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
           message: 'Failed to process DLQ item',
         },
       });
+      return;
     }
 
     // Re-queue the webhook for retry
@@ -462,21 +486,11 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
 /**
  * POST /internal/webhooks/process-outbox
  * Process outbox items (internal endpoint for background job)
+ *
+ * Previously gated by an ad-hoc `?secret=` query-param check.
+ * That check has been removed — requireAdminAuth above provides real auth.
  */
 webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
-  const secret = req.query.secret as string;
-
-  if (!secret) {
-    logger.warn('Webhook outbox processing endpoint called without secret', undefined);
-    res.status(400).json({
-      error: {
-        code: 'MISSING_SECRET',
-        message: 'Webhook secret is required as query parameter',
-      },
-    });
-    return;
-  }
-
   try {
     const readyItems = webhookDeliveryStore.getReadyOutboxItems();
     let processed = 0;
@@ -526,19 +540,18 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
 /**
  * POST /internal/webhooks/retry
  * Process pending webhook retries (internal endpoint for background job)
+ *
+ * Previously gated by an ad-hoc `?secret=` query-param check.
+ * That check has been removed — requireAdminAuth above provides real auth.
  */
 webhooksRouter.post('/retry', express.json(), async (req, res) => {
   const requestId = req.id;
-  const secret = req.query.secret as string;
-
-  if (!secret) {
-    logger.warn('Webhook retry endpoint called without secret', undefined);
-    res.status(400).json(
-      errorResponse('MISSING_SECRET', 'Webhook secret is required as query parameter', undefined, requestId)
-    );
-  }
 
   try {
+    // Extract the webhook secret from the request body for use with processPendingRetries.
+    // The admin-level auth has already been validated by requireAdminAuth above; this
+    // secret is the per-delivery webhook signing secret, not an admin credential.
+    const { secret = '' } = req.body ?? {};
     await webhookService.processPendingRetries(secret);
     res.json(successResponse({
       ok: true,
