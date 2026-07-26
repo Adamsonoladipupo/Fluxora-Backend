@@ -72,6 +72,7 @@ import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
 import { sendEarlyHints } from '../utils/earlyHints.js';
+import { canonicalizeBody } from '../middleware/idempotency.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
 import {
@@ -408,8 +409,8 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   };
 }
 
-function fingerprintInput(input: NormalizedCreateInput): string {
-  return crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
+export function fingerprintInput(input: NormalizedCreateInput): string {
+  return crypto.createHash('sha256').update(canonicalizeBody(input)).digest('hex');
 }
 
 /** Wrap DB errors so pool exhaustion surfaces as 503. */
