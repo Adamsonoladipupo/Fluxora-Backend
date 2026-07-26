@@ -25,6 +25,7 @@ import {
   REINDEX_LOCK_NAMESPACE,
 } from '../../src/state/adminStateLock.js';
 import type { Lock } from '../../src/state/adminStateLock.js';
+import { createRedisClient, quitAllRedisClients } from '../../src/redis/client.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -347,4 +348,65 @@ async function createProcessScopeNoLock() {
     triggerReindex: mod.triggerReindex,
     getReindexState: mod.getReindexState,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests (real Redis)
+// ---------------------------------------------------------------------------
+
+const REDIS_INTEGRATION_ENABLED = process.env['REDIS_INTEGRATION'] === 'true';
+const REDIS_TEST_URL = process.env['REDIS_TEST_URL'] ?? 'redis://localhost:6379';
+
+if (REDIS_INTEGRATION_ENABLED) {
+  describe('Integration: AdminStateLock with real Redis', () => {
+    afterEach(async () => {
+      // Close any Redis clients created during tests to avoid leaked sockets.
+      try {
+        await quitAllRedisClients();
+      } catch {
+        // ignore
+      }
+      // Reset module state so subsequent tests are isolated.
+      vi.resetModules();
+      const mod = await import('../../src/state/adminState.js');
+      mod._resetForTest({ clearLock: true, clearPersistence: true });
+    });
+
+    it('serializes reindex triggers across two process instances using real Redis', async () => {
+      // Helper to create a module scope backed by a real Redis client.
+      async function createProcessScopeReal(lockNamespace: string, timeoutMs?: number) {
+        vi.resetModules();
+        const client = await createRedisClient({ url: REDIS_TEST_URL, enabled: true });
+        const mod = await import('../../src/state/adminState.js');
+        mod._resetForTest();
+        const lock = new RedisDistributedLock(client, lockNamespace, { timeoutMs });
+        mod._setReindexLockForTest(lock);
+        return { triggerReindex: mod.triggerReindex, getReindexState: mod.getReindexState, client, lock };
+      }
+
+      const pA = await createProcessScopeReal('reindex', TEST_LOCK_TIMEOUT_MS);
+      const pB = await createProcessScopeReal('reindex', TEST_LOCK_TIMEOUT_MS);
+
+      // Let process B acquire the lock first (competing process).
+      const held = await pB.lock.acquire();
+
+      // Process A should observe the lock and return idle state.
+      const loser = await pA.triggerReindex();
+      expect(loser.status).toBe('idle');
+
+      // Release the competing lock and retry — should start running.
+      await held.release();
+      const winner = await pA.triggerReindex();
+      expect(winner.status).toBe('running');
+
+      // Wait for background job to complete and assert final state.
+      await wait(400);
+      expect(pA.getReindexState().status).toBe('completed');
+    });
+  });
+} else {
+  // Skip integration tests unless explicitly enabled.
+  describe.skip('Integration: AdminStateLock with real Redis (disabled)', () => {
+    it('skipped — set REDIS_INTEGRATION=true to run', () => {});
+  });
 }
