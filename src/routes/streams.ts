@@ -826,7 +826,22 @@ streamsRouter.get(
 
 /**
  * GET /api/streams/:id/export.jsonld
- * Export a single stream as JSON-LD for data portability.
+ *
+ * Export a single stream as a JSON-LD document for data portability.
+ *
+ * The response body is a raw JSON-LD object (not wrapped in the standard
+ * `successResponse` envelope) so that linked-data processors can consume it
+ * directly without unwrapping.
+ *
+ * Headers
+ * ───────
+ * - Content-Type: application/ld+json
+ * - ETag / Last-Modified: identical to GET /:id for cache validators
+ * - Cache-Control: public,max-age=300 for terminal streams; private,no-store otherwise
+ * - Link: <https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"
+ *
+ * Authentication: API key + streams:read scope (same as GET /:id).
+ * Rate limiting: inherits the global rate-limiter applied to all /api/* routes.
  */
 streamsRouter.get(
   '/:id/export.jsonld',
@@ -834,13 +849,15 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
+
     if (!id) {
       throw notFound('Stream', '');
     }
-    debug('Exporting stream as JSON-LD', { id });
 
-    let record;
+    debug('Exporting stream as JSON-LD', { id, requestId });
+
+    let record: StreamRecord | undefined | null;
     try {
       record = await streamRepository.getById(id);
     } catch (err) {
@@ -849,16 +866,39 @@ streamsRouter.get(
 
     if (!record) throw notFound('Stream', id);
 
-    const jsonld = toStreamJsonLd(record!);
-    setStreamResourceHeaders(res, record!);
+    // Conditional GET — reuse the same ETag fingerprint as GET /:id so that
+    // clients which already validated the plain-JSON representation can skip
+    // re-fetching the JSON-LD document unconditionally.
+    const etag = streamEntityTag(record);
+    const rawIfNoneMatch = req.headers['if-none-match'];
+    if (rawIfNoneMatch !== undefined) {
+      const header = Array.isArray(rawIfNoneMatch)
+        ? rawIfNoneMatch.join(', ')
+        : rawIfNoneMatch;
+      if (matchesIfNoneMatch(header, etag)) {
+        res.set('ETag', etag);
+        res.set('Last-Modified', new Date(record.updated_at).toUTCString());
+        res.status(304).end();
+        return;
+      }
+    }
+
+    const jsonLdDoc = toStreamJsonLd(record);
+
+    setStreamResourceHeaders(res, record);
     res.set(
       'Cache-Control',
-      isTerminalStatus(record!.status as ApiStreamStatus)
+      isTerminalStatus(record.status as ApiStreamStatus)
         ? CACHEABLE_STREAM_HEADERS
         : NO_STORE_STREAM_HEADERS,
     );
+    // Advertise the context document per the JSON-LD HTTP spec (§4.1).
+    res.set(
+      'Link',
+      '<https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
+    );
     res.type('application/ld+json');
-    res.send(JSON.stringify(jsonld));
+    res.send(JSON.stringify(jsonLdDoc));
   }),
 );
 
