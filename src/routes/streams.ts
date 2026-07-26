@@ -180,6 +180,7 @@ type NormalizedCreateInput = {
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
 const NO_STORE_STREAM_HEADERS = 'private, no-store';
+const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
@@ -252,6 +253,28 @@ function toApiStream(record: StreamRecord): Stream {
     endTime:       record.end_time,
     status:        record.status,
   };
+}
+
+/**
+ * Resolve a stable rollout identity for feature flag bucketing.
+ *
+ * @security API-key authenticated requests prefer the server-side key id. When
+ * that is not available, raw X-API-Key header material is used only as input to
+ * the feature flag hash and is never logged or included in responses.
+ */
+export function getFeatureFlagRequesterId(req: Request): string {
+  const keyId = (req as Request & { keyId?: unknown }).keyId;
+  if (typeof keyId === 'string' && keyId.trim() !== '') {
+    return `key:${keyId}`;
+  }
+
+  const rawApiKey = req.headers['x-api-key'];
+  const apiKey = Array.isArray(rawApiKey) ? rawApiKey[0] : rawApiKey;
+  if (typeof apiKey === 'string' && apiKey.trim() !== '') {
+    return `api-key:${apiKey.trim()}`;
+  }
+
+  return `ip:${req.ip ?? 'anonymous'}`;
 }
 
 type StreamResourceMetadata = {
@@ -576,13 +599,8 @@ streamsRouter.get(
     if (includeTotal && result!.total !== undefined) response.total = result!.total;
 
     // Feature flag: streams_enhanced_response — add _meta field for opted-in requesters.
-    // The requester is identified by API key or IP; falls back to 'anonymous'.
-    // This is a zero-risk opt-in: if the flag is not configured, enhanced stays false.
-    const requesterId: string =
-      (req as unknown as Record<string, unknown>)['apiKey'] as string
-        ?? req.ip
-        ?? 'anonymous';
-    if (isFlagEnabled('streams_enhanced_response', requesterId)) {
+    const requesterId = getFeatureFlagRequesterId(req);
+    if (isFlagEnabled(STREAMS_ENHANCED_RESPONSE_FLAG, requesterId)) {
       response._meta = { enhanced: true };
     }
 
