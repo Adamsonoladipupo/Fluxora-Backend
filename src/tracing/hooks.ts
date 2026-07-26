@@ -323,9 +323,8 @@ export class Tracer {
                 resolve();
               }
             });
-          }
-          this.activeSpans.delete(span.context.spanId);
           });
+          this.activeSpans.delete(span.context.spanId);
         }
       }
     }
