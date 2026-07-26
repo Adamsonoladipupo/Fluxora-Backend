@@ -18,7 +18,19 @@
  */
 
 import { createHash } from 'node:crypto';
+import { Counter } from 'prom-client';
 import type { RedisClient } from './client.js';
+import { registry } from '../metrics.js';
+import { logger } from '../lib/logger.js';
+
+export const webhookRateLimiterFailOpenTotal =
+  (registry.getSingleMetric('fluxora_webhook_rate_limiter_fail_open_total') as Counter<'consumer_hash'>) ||
+  new Counter({
+    name: 'fluxora_webhook_rate_limiter_fail_open_total',
+    help: 'Total webhook rate limiter fail-open activations on Redis error',
+    labelNames: ['consumer_hash'] as const,
+    registers: [registry],
+  });
 
 export interface RateLimitConfig {
   /** Maximum delivery attempts allowed within the window. */
@@ -151,7 +163,13 @@ export class WebhookRateLimiter {
     } catch (err) {
       // Fail-open: log and allow the attempt so a Redis outage does not
       // silently halt all webhook deliveries.
-      console.error('[WebhookRateLimiter] Redis error — failing open:', err);
+      const consumerHash = hashUrl(consumerUrl);
+      webhookRateLimiterFailOpenTotal.inc({ consumer_hash: consumerHash });
+      logger.error('WebhookRateLimiter Redis error — failing open', undefined, {
+        operation: 'checkLimit',
+        consumerKey: consumerHash,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return { canAttempt: true, retryAfterMs: null };
     }
   }
