@@ -1,16 +1,11 @@
 import { EventEmitter } from 'node:events';
 
-
-
-
 import type { StreamEventRecord } from '../db/types.js';
 import {
   sseLiveSubscribersGauge,
   sseEventListenersGauge,
   sseSubscriberErrorsTotal,
 } from '../metrics/businessMetrics.js';
-import { logger } from '../logging/logger.js';
-
 import { logger } from '../lib/logger.js';
 
 export const SSE_STREAM_UPDATE_EVENT = 'stream_update';
@@ -39,8 +34,7 @@ export const SSE_CLOSE_REASONS = {
   SERVER_SHUTDOWN: 'server_shutdown',
 } as const;
 
-export type SseCloseReason = typeof SSE_CLOSE_REASONS[keyof typeof SSE_CLOSE_REASONS];
-
+export type SseCloseReason = (typeof SSE_CLOSE_REASONS)[keyof typeof SSE_CLOSE_REASONS];
 
 // Central EventEmitter to handle SSE broadcast subscriptions locally.
 export const sseEventBus = new EventEmitter();
@@ -95,11 +89,9 @@ function dispatchLiveSseEvent(event: LiveSseStreamUpdateEvent): void {
           message: error.message,
         },
       });
-
     }
   }
 }
-
 
 function isDispatchAttached(): boolean {
   return sseEventBus.listeners(SSE_STREAM_UPDATE_EVENT).includes(dispatchLiveSseEvent);
@@ -129,7 +121,7 @@ function detachDispatchIfIdle(): void {
  */
 export function subscribeToSseStream(
   streamId: string,
-  subscriber: SseStreamSubscriber,
+  subscriber: SseStreamSubscriber
 ): () => void {
   let subscribers = liveSubscribersByStreamId.get(streamId);
   if (!subscribers) {
@@ -192,7 +184,7 @@ const sseShutdownCallbacks = new Set<SseShutdownEntry>();
  */
 export function registerSseShutdownCallback(
   drain: () => void | Promise<void>,
-  forceClose?: () => void,
+  forceClose?: () => void
 ): () => void {
   const entry: SseShutdownEntry = { drain, forceClose };
   sseShutdownCallbacks.add(entry);
@@ -210,7 +202,7 @@ export function registerSseShutdownCallback(
 async function raceDrainCallback(
   drain: () => void | Promise<void>,
   forceClose: (() => void) | undefined,
-  timeoutMs: number,
+  timeoutMs: number
 ): Promise<boolean> {
   let settled = false;
 
@@ -260,11 +252,7 @@ export async function drainSseEventBus(timeoutMs: number): Promise<void> {
   let forceClosed = 0;
 
   for (const entry of entries) {
-    const completed = await raceDrainCallback(
-      entry.drain,
-      entry.forceClose,
-      timeoutMs,
-    );
+    const completed = await raceDrainCallback(entry.drain, entry.forceClose, timeoutMs);
     if (!completed) {
       forceClosed++;
     }
@@ -273,15 +261,11 @@ export async function drainSseEventBus(timeoutMs: number): Promise<void> {
   sseShutdownCallbacks.clear();
 
   if (forceClosed > 0) {
-    logger.warn(
-      'SSE connections force-closed during shutdown drain',
-      undefined,
-      {
-        forceClosed,
-        total: entries.length,
-        timeoutMs,
-      },
-    );
+    logger.warn('SSE connections force-closed during shutdown drain', undefined, {
+      forceClosed,
+      total: entries.length,
+      timeoutMs,
+    });
   }
 
   // Tear down the shared dispatcher so no further events are fanned out.

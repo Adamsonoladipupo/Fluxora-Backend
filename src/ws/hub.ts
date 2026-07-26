@@ -1029,7 +1029,12 @@ export class StreamHub extends EventEmitter {
       return;
     }
 
-    ws.send(message);
+    try {
+      ws.send(message);
+    } catch {
+      this.metrics.droppedMessages += safeEvents.length;
+      return;
+    }
     this.metrics.sentMessages++;
 
     const state = this.clients.get(ws);
@@ -1094,7 +1099,13 @@ export class StreamHub extends EventEmitter {
         continue;
       }
 
-      ws.send(message);
+      try {
+        ws.send(message);
+      } catch {
+        // If send throws (e.g. a race with concurrent terminate), skip this
+        // client without counting it as sent or crashing the broadcast.
+        continue;
+      }
       this.metrics.sentMessages++;
       sent++;
 
@@ -1251,6 +1262,18 @@ export class StreamHub extends EventEmitter {
    */
   _getStreamSubscriptions(): ReadonlyMap<string, Set<WebSocket>> {
     return this.streamSubscriptions;
+  }
+
+  /**
+   * Internal entry-point used by tests and diagnostics to inspect recipient
+   * subscription cardinality. Only exposes stable map and set references.
+   *
+   * @security Exposes only recipientAddress keys and subscriber Set sizes;
+   *           raw WebSocket references are still opaque and must not be
+   *           mutated by callers.
+   */
+  _getRecipientSubscriptions(): ReadonlyMap<string, Set<WebSocket>> {
+    return this.recipientSubscriptions;
   }
 
   getMetrics(): Readonly<BackpressureMetrics> {

@@ -203,6 +203,16 @@ function validationMessage(issues: z.ZodIssue[]): string {
   return issues[0]?.message ?? 'Invalid WebSocket message';
 }
 
+/**
+ * Parse an inbound WebSocket control message from a client.
+ *
+ * This parser accepts both modern and aliased filter fields, including
+ * nested `filter` objects, and normalizes them to a stable internal format.
+ * Invalid messages are rejected with structured error codes.
+ *
+ * @param raw Parsed JSON value from the client frame.
+ * @returns The normalized WebSocket client message or a validation error.
+ */
 export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
   if (!isObject(raw)) {
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a JSON object' };

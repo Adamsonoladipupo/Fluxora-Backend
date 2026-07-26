@@ -899,6 +899,9 @@ class FluxoraClient:
         return self._request("POST", "/internal/indexer/events/replay", json_data={"contract_id": contract_id, "ledger": ledger})
 `;
 
+  // 9. fluxora/py.typed  (PEP 561 marker — zero-byte file)
+  files['fluxora/py.typed'] = '';
+
   return files;
 }
 

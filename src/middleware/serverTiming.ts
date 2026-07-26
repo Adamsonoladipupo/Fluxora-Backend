@@ -155,13 +155,20 @@ export function serverTimingMiddleware(): (req: Request, res: Response, next: Ne
       if (typeof encoding === 'function') {
         return originalEnd(chunk, encoding);
       }
-      return originalEnd(chunk, encoding, cb);
+      return originalEnd(chunk, encoding ?? 'utf8', cb);
     }) as typeof res.end;
 
     const originalWrite = res.write.bind(res);
-    res.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding, cb?: (error?: Error | null) => void) => {
+    res.write = ((
+      chunk: string | Uint8Array,
+      encoding?: BufferEncoding | ((error?: Error | null) => void),
+      cb?: (error?: Error | null) => void,
+    ) => {
       applyServerTimingHeader(res, registry);
-      return originalWrite(chunk, encoding, cb);
+      if (typeof encoding === 'function') {
+        return originalWrite(chunk, encoding);
+      }
+      return originalWrite(chunk, encoding ?? 'utf8', cb);
     }) as typeof res.write;
 
     next();

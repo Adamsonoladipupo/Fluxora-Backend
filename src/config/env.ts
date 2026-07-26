@@ -293,6 +293,12 @@ export const EnvSchema = z.object({
    GRPC_HEALTH_ENABLED: booleanEnv().default(false),
    /** Port the gRPC health service binds to when enabled. Separate from PORT (HTTP). */
    GRPC_HEALTH_PORT: integerEnv('GRPC_HEALTH_PORT', 1, 65535).default(50051),
+   /** Enables the optional gRPC transcoding gateway for indexer communication. Default off. */
+   GRPC_GATEWAY_ENABLED: booleanEnv().default(false),
+   /** Port the gRPC indexer gateway binds to when enabled. */
+   GRPC_GATEWAY_PORT: integerEnv('GRPC_GATEWAY_PORT', 1, 65535).default(50052),
+   /** When true, reject non-TLS indexer worker connections (fail-closed). Defaults to true in production, false otherwise. */
+   INDEXER_MTLS_REQUIRED: booleanEnv().optional(),
    INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
    INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
   DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
@@ -342,6 +348,14 @@ export const EnvSchema = z.object({
   STARTUP_PROBE_POSTGRES_TIMEOUT_MS: integerEnv('STARTUP_PROBE_POSTGRES_TIMEOUT_MS', 1).default(5_000),
   STARTUP_PROBE_REDIS_TIMEOUT_MS: integerEnv('STARTUP_PROBE_REDIS_TIMEOUT_MS', 1).default(3_000),
   STARTUP_PROBE_STELLAR_TIMEOUT_MS: integerEnv('STARTUP_PROBE_STELLAR_TIMEOUT_MS', 1).default(5_000),
+
+  /**
+   * Percentage of traffic (0–100) to route through the canary code path.
+   * 0 disables canary tagging entirely (default). Set to e.g. 10 to tag
+   * 10 % of clients deterministically as canary based on a SHA-256 hash
+   * of their identity (API key or IP).
+   */
+  CANARY_TRAFFIC_PERCENT: integerEnv('CANARY_TRAFFIC_PERCENT', 0, 100).default(0),
 }).passthrough().superRefine((env, ctx) => {
   const stellarNetwork = resolvedStellarNetwork(env);
   const expectedPassphrase = STELLAR_NETWORK_PASSPHRASES[stellarNetwork];
@@ -364,6 +378,32 @@ export const EnvSchema = z.object({
       path: ['API_KEY_PEPPER'],
       message: 'API_KEY_PEPPER is required when API_KEYS is configured',
     });
+  }
+
+  if (env.NODE_ENV === 'production') {
+    if (env.LOG_LEVEL === 'debug') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['LOG_LEVEL'],
+        message: 'LOG_LEVEL must not be "debug" in production',
+      });
+    }
+
+    if (env.CORS_ALLOWED_ORIGINS !== undefined && env.CORS_ALLOWED_ORIGINS.includes('*')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['CORS_ALLOWED_ORIGINS'],
+        message: 'CORS_ALLOWED_ORIGINS must not contain a wildcard "*" origin in production',
+      });
+    }
+
+    if (env.PGCRYPTO_KEY === undefined || env.PGCRYPTO_KEY.length < 32) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PGCRYPTO_KEY'],
+        message: 'PGCRYPTO_KEY is required in production (minimum 32 characters)',
+      });
+    }
   }
 });
 
@@ -467,6 +507,12 @@ export interface Config {
   grpcHealthEnabled: boolean;
   /** Port the gRPC health service binds to when enabled. */
   grpcHealthPort: number;
+  /** Enables the optional gRPC transcoding gateway for indexer communication. */
+  grpcGatewayEnabled: boolean;
+  /** Port the gRPC indexer gateway binds to when enabled. */
+  grpcGatewayPort: number;
+  /** When true, reject non-TLS indexer worker connections (fail-closed). */
+  indexerMtlsRequired: boolean;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -489,6 +535,12 @@ export interface Config {
   startupProbeRedisTimeoutMs: number;
   /** Per-attempt timeout for each Stellar RPC (soft-tier) retry attempt, ms. */
   startupProbeStellarTimeoutMs: number;
+
+  /**
+   * Percentage of traffic (0–100) to tag as canary.
+   * 0 means no canary tagging. Sourced from CANARY_TRAFFIC_PERCENT.
+   */
+  canaryTrafficPercent: number;
 }
 
 export class ConfigError extends Error {
@@ -646,6 +698,9 @@ function toConfig(env: ParsedEnv): Config {
     healthCheckIntervalMs: env.HEALTH_CHECK_INTERVAL_MS,
     grpcHealthEnabled: env.GRPC_HEALTH_ENABLED,
     grpcHealthPort: env.GRPC_HEALTH_PORT,
+    grpcGatewayEnabled: env.GRPC_GATEWAY_ENABLED,
+    grpcGatewayPort: env.GRPC_GATEWAY_PORT,
+    indexerMtlsRequired: env.INDEXER_MTLS_REQUIRED ?? isProduction,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
@@ -657,6 +712,8 @@ function toConfig(env: ParsedEnv): Config {
     startupProbePostgresTimeoutMs: env.STARTUP_PROBE_POSTGRES_TIMEOUT_MS,
     startupProbeRedisTimeoutMs: env.STARTUP_PROBE_REDIS_TIMEOUT_MS,
     startupProbeStellarTimeoutMs: env.STARTUP_PROBE_STELLAR_TIMEOUT_MS,
+
+    canaryTrafficPercent: env.CANARY_TRAFFIC_PERCENT,
   };
 }
 
