@@ -1,7 +1,6 @@
-import Redis from 'ioredis';
 import { getConfig } from '../config/env.js';
 import { warn, info, debug } from '../utils/logger.js';
-import { calculateNextRetryDelay } from '../lib/retry.js';
+import { createRedisClient, type RedisClient } from './client.js';
 
 /**
  * Redis key prefix for JWT revocation entries.
@@ -15,7 +14,8 @@ const REVOCATION_PREFIX = 'jwt:revoked';
  */
 const DEFAULT_REVOCATION_TTL_SECONDS = 7 * 24 * 60 * 60; // 604800 seconds
 
-let redis: Redis | null = null;
+let redis: RedisClient | null = null;
+let initPromise: Promise<RedisClient> | null = null;
 
 export interface JwtRevocationOptions {
   ttl?: number;
@@ -30,38 +30,29 @@ export interface JwtRevocationResult {
 
 /**
  * Lazily initialize and return the shared Redis client.
- * Reuses the same connection across calls.
+ * Reuses the same connection across calls and is safe for concurrent callers.
+ *
+ * Uses the shared {@link createRedisClient} factory so the connection is
+ * tracked for graceful shutdown via {@link quitAllRedisClients} and benefits
+ * from the same standalone/sentinel/cluster mode support, retry strategy, and
+ * structured logging as every other Redis-backed subsystem.
  */
-function getRedisClient(): Redis {
+async function getRedisClient(): Promise<RedisClient> {
   if (redis) return redis;
 
-  const config = getConfig();
-  redis = new Redis({
-    host: config.redisHost ?? 'localhost',
-    port: config.redisPort ?? 6379,
-    password: config.redisPassword || undefined,
-    db: config.redisDb ?? 0,
-    retryStrategy: (times) => {
-      const delay = calculateNextRetryDelay(times - 1, {
-        baseDelayMs: 50,
-        maxDelayMs: 2000,
-        maxAttempts: 10,
-      });
-      if (delay === 0) return null; // stop retrying
-      warn('Redis retry', { attempt: times, delayMs: delay });
-      return delay;
-    },
-    maxRetriesPerRequest: 3,
-  });
+  if (!initPromise) {
+    const config = getConfig();
+    initPromise = createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+  }
 
-  redis.on('error', (err) => {
-    warn('Redis connection error', { error: err.message });
-  });
-
-  redis.on('connect', () => {
-    info('Redis connected for JWT revocation store');
-  });
-
+  redis = await initPromise;
   return redis;
 }
 
@@ -183,10 +174,10 @@ export async function revoke(
     return { revoked: false, ttlSeconds: 0 };
   }
 
-  const client = getRedisClient();
+  const client = await getRedisClient();
   const key = buildKey(jti);
 
-  await client.set(key, '1', 'EX', ttl);
+  await client.set(key, '1', { ex: ttl });
   info('JWT revoked', { jti, ttlSeconds: ttl });
   return { revoked: true, ttlSeconds: ttl };
 }
@@ -210,12 +201,11 @@ export async function isRevoked(jti: string): Promise<boolean> {
     return true;
   }
 
-  const client = getRedisClient();
+  const client = await getRedisClient();
   const key = buildKey(jti);
 
   try {
-    const exists = await client.exists(key);
-    const revoked = exists > 0;
+    const revoked = await client.exists(key);
     debug('JWT revocation check', { jti, revoked });
     return revoked;
   } catch (error) {
@@ -235,8 +225,9 @@ export async function isRevoked(jti: string): Promise<boolean> {
  */
 export async function closeRevocationStore(): Promise<void> {
   if (redis) {
-    await redis.quit();
+    await redis.close();
     redis = null;
+    initPromise = null;
     info('JWT revocation store Redis connection closed');
   }
 }
