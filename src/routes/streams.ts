@@ -1186,7 +1186,8 @@ streamsRouter.get(
     // 2. Reserve bounded SSE capacity before repository work or header flush.
     const clientIp = getClientIp(req);
     const sseLimits = resolveSseConnectionLimits();
-    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
+    const apiKey = (req.headers['x-api-key'] as string | undefined) ?? undefined;
+    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits, apiKey);
 
     if (!connectionAttempt.ok) {
       res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
@@ -1537,7 +1538,8 @@ streamsRouter.get(
     // 2. Reserve connection capacity from sseConnectionLimiter
     const clientIp = getClientIp(req);
     const sseLimits = resolveSseConnectionLimits();
-    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
+    const apiKey = (req.headers['x-api-key'] as string | undefined) ?? undefined;
+    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits, apiKey);
 
     if (!connectionAttempt.ok) {
       res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
