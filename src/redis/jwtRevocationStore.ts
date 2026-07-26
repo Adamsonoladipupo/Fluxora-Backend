@@ -185,9 +185,14 @@ export async function revoke(
 
   const client = getRedisClient();
   const key = buildKey(jti);
+  try {
 
   await client.set(key, '1', 'EX', ttl);
   info('JWT revoked', { jti, ttlSeconds: ttl });
+    } catch (err) {
+    warn('Failed to revoke JWT — Redis error', { jti, error: (err as Error).message });
+    return { revoked: false, ttlSeconds: 0 };
+  }
   return { revoked: true, ttlSeconds: ttl };
 }
 
