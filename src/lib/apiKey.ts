@@ -268,51 +268,27 @@ export function getApiKeyFromRequest(
 }
 
 /**
- * Retrieves the scopes for an API key by its ID.
- * Returns the scopes array or undefined if the key is not found.
- */
-export function getApiKeyScopes(id: string): string[] | undefined {
-  const record = store.get(id);
-  return record?.scopes;
-}
-
-/**
- * Validates if an API key has a specific scope.
- * Returns true if the keyxists, is active, and has the required scope.
- */
-export function hasScope(keyId: string, requiredScope: string): boolean {
-  const record = store.get(keyId);
-  if (!record || !record.active) return false;
-  return record.scopes.includes(requiredScope);
-}
-
-/**
- * Retrieves a key record by raw API key value.
+ * Retrieves an active key record by raw API key value.
  * Used for authentication to get the full record (including scopes).
  * Exposed for middleware/auth use.
+ *
+ * Resolves candidate active rows by the indexed key prefix (O(log n)) and then
+ * performs constant-time comparison against candidate hashes.
  */
-export function getApiKeyRecord(rawKey: string): ApiKeyRecord | undefined {
-  if (!rawKey) return undefined;
+export async function getApiKeyRecord(rawKey: string): Promise<ApiKeyRecord | undefined> {
+  if (!rawKey || typeof rawKey !== 'string') {
+    return undefined;
+  }
 
-  const hash = sha256hex(rawKey);
-  const hashBuf = Buffer.from(hash, 'hex');
+  const prefix = rawKey.slice(0, PREFIX_LENGTH);
+  const candidates = await apiKeyRepository.findActiveByPrefix(prefix);
 
-  for (const record of store.values()) {
-    if (!record.active) continue;
-    try {
-      const storedBuf = Buffer.from(record.keyHash, 'hex');
-      if (storedBuf.length === hashBuf.length && timingSafeEqual(storedBuf, hashBuf)) {
-        return record;
-      }
-    } catch {
-      // length mismatch — skip
+  let matchedRecord: ApiKeyRecord | undefined;
+  for (const candidate of candidates) {
+    if (hashesMatch(hashKey(rawKey, candidate.salt), candidate.keyHash)) {
+      matchedRecord = candidate;
     }
   }
 
-  return undefined;
-}
-
-/** Exposed for tests only — clears the in-memory store. */
-export function _resetApiKeyStoreForTest(): void {
-  store.clear();
+  return matchedRecord;
 }
