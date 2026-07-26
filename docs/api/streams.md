@@ -181,30 +181,109 @@ The response uses `application/ld+json` Content-Type and uses string serializati
 
 ## Method Overrides
 
-For legacy clients that cannot issue HTTP methods like `PATCH`, `PUT`, or `DELETE`, you can use the method override feature. This allows you to send a `POST` request with the intended method specified in either:
+For legacy infrastructure or middleboxes that can only issue `POST` requests, Fluxora supports HTTP Method Override. You can submit a `POST` request and specify the target HTTP method using:
 
-1. The `X-HTTP-Method-Override` HTTP header
-2. The `_method` query parameter
+1. **HTTP Header**: `X-HTTP-Method-Override: <METHOD>` (Recommended)
+2. **Query Parameter**: `POST /api/resource?_method=<METHOD>`
 
-This feature is only available for authenticated requests and is restricted to `PATCH`, `DELETE`, and `PUT`. Attempts to override unauthenticated routes or use unsupported methods will result in a `400 Bad Request`.
+### Supported Override Methods
 
-### Examples
+Method overrides are strictly limited to mutating or idempotent methods:
+- `PATCH` — Partial updates (e.g. updating stream status)
+- `PUT` — Full resource updates
+- `DELETE` — Resource cancellation or erasure
 
-Using the HTTP header:
+### Security & Restrictions
+
+- **Authentication Requirement**: Method override is only enabled for authenticated requests carrying valid Bearer tokens (`Authorization: Bearer <token>`) or API keys (`X-API-Key: <key>`).
+- **Public & Unauthenticated Endpoints**: Method override is strictly disabled on public endpoints (`/`), health probes (`/health`), authentication routes (`/api/auth/*`), webhooks (`/internal/webhooks/*`), indexer endpoints (`/internal/indexer/*`), and documentation routes (`/docs`).
+- **Priority Rule**: When both the `X-HTTP-Method-Override` header and `_method` query parameter are present, the header value takes precedence.
+- **Validation**: Override values are normalized to uppercase (e.g. `patch` → `PATCH`). Attempting to override to unsupported methods (`GET`, `POST`, `OPTIONS`, `HEAD`, `TRACE`, `CONNECT`, or arbitrary strings) will return `400 Bad Request` with a `VALIDATION_ERROR` error envelope.
+- **Audit Logging**: Every method override is logged in structured server logs with the original method (`POST`), effective method, authenticated user identifier, request path, and timestamp.
+
+### Request Examples
+
+#### 1. PATCH Request (Header Override)
+
+Update a stream's status to `paused` using the `X-HTTP-Method-Override` header:
+
 ```http
-POST /api/streams/stream-abc123-0/status
-Authorization: Bearer <token>
+POST /api/streams/stream-abc123-0/status HTTP/1.1
+Host: api.fluxora.io
+Authorization: Bearer <JWT_TOKEN>
 X-HTTP-Method-Override: PATCH
 Content-Type: application/json
 
-{ "status": "paused" }
+{
+  "status": "paused"
+}
 ```
 
-Using the query parameter:
+Equivalent cURL:
+
+```bash
+curl -X POST "http://localhost:3000/api/streams/stream-abc123-0/status" \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -H "X-HTTP-Method-Override: PATCH" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"paused"}'
+```
+
+#### 2. PUT Request (Query Parameter Override)
+
+Full update of stream configuration using `?_method=PUT`:
+
 ```http
-POST /api/streams/stream-abc123-0/status?_method=PATCH
-Authorization: Bearer <token>
+POST /api/streams/stream-abc123-0?_method=PUT HTTP/1.1
+Host: api.fluxora.io
+Authorization: Bearer <JWT_TOKEN>
 Content-Type: application/json
 
-{ "status": "paused" }
+{
+  "ratePerSecond": "0.50"
+}
+```
+
+Equivalent cURL:
+
+```bash
+curl -X POST "http://localhost:3000/api/streams/stream-abc123-0?_method=PUT" \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"ratePerSecond":"0.50"}'
+```
+
+#### 3. DELETE Request (Header Override)
+
+Cancel a stream using `X-HTTP-Method-Override: DELETE`:
+
+```http
+POST /api/streams/stream-abc123-0/cancel HTTP/1.1
+Host: api.fluxora.io
+Authorization: Bearer <JWT_TOKEN>
+X-HTTP-Method-Override: DELETE
+Content-Type: application/json
+```
+
+Equivalent cURL:
+
+```bash
+curl -X POST "http://localhost:3000/api/streams/stream-abc123-0/cancel" \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -H "X-HTTP-Method-Override: DELETE"
+```
+
+#### 4. Invalid Method Response (400 Bad Request)
+
+If an unsupported method override (such as `GET`) is supplied:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Unsupported method override: GET. Only PATCH, PUT, and DELETE are supported.",
+    "requestId": "req-98765"
+  }
+}
 ```
