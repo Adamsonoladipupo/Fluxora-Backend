@@ -26,3 +26,31 @@ To detect misconfiguration or active attacks, any client-certificate validation 
 - It strictly **excludes** any private key material or full PEM blobs.
 
 Failures also increment the `indexer_mtls_validation_failures_total` Prometheus counter, which includes a `reason` label for granular alerting and faster triage.
+
+## Double-Submit CSRF Cookie Protection
+
+To protect browser-originated clients (such as dashboard applications) against Cross-Site Request Forgery (CSRF), Fluxora implements a Double-Submit CSRF Cookie protection scheme (`src/middleware/csrf.ts`).
+
+### Architecture & Mechanics
+
+1. **Tokens**:
+   - **Cookie**: `fluxora_csrf` (random 32-byte hex string, SameSite=Lax/Strict).
+   - **Header**: `X-CSRF-Token` (or case-insensitive `x-csrf-token`).
+
+2. **Scope of Enforcement**:
+   - **Target Endpoints**: Enforced on mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`) to `/api/streams` (and mutating `/api` endpoints).
+   - **Safe Methods**: `GET`, `HEAD`, and `OPTIONS` bypass CSRF validation.
+   - **Non-Browser Exemption**: Requests authenticated via `Authorization: Bearer <JWT>` or `X-API-Key: <Key>` headers are non-browser/machine-to-machine calls and do not use ambient browser cookies. These requests bypass CSRF checks to maintain backward compatibility with external API integrations.
+   - **Cookie-Authenticated Sessions**: Requests that rely on ambient browser cookies (and do not supply Bearer or API-key credentials) MUST present both the `fluxora_csrf` cookie and matching `X-CSRF-Token` header.
+
+3. **Constant-Time Token Comparison**:
+   Token comparison is executed in constant time using Node.js `crypto.timingSafeEqual` with byte-length matching (identical to `src/webhooks/signature.ts`) to prevent timing side-channel attacks:
+   ```ts
+   const bufA = Buffer.from(cookieToken, 'utf8');
+   const bufB = Buffer.from(headerToken, 'utf8');
+   const isValid = bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+   ```
+
+4. **Error Handling**:
+   Requests failing CSRF validation return an HTTP `403 Forbidden` JSON envelope with code `FORBIDDEN` and a message specifying whether the CSRF token was missing or mismatched.
+
