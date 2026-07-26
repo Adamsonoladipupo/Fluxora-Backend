@@ -442,4 +442,46 @@ PostgreSQL partition pruning is driven by predicates on the partition key (`happ
 
 ### Verification via EXPLAIN
 
-Partition pruning efficiency is verified via integration tests (`tests/db/contractEvents.partitionPruning.test.ts`) that execute `EXPLAIN (FORMAT JSON)` against representative store query shapes and inspect the plan output structure.
+Partition pruning efficiency is verified via integration tests
+(`tests/db/contractEvents.partitionPruning.test.ts`) that execute
+`EXPLAIN (FORMAT JSON)` against representative store query shapes and inspect
+the plan output structure.
+
+#### Test coverage
+
+| Test category | Description |
+|---|---|
+| **Offline — plan helpers** | `planScansPartition` / `getScannedPartitions` unit-tested against mock EXPLAIN JSON — no database required |
+| **Offline — InMemoryStore** | `InMemoryContractEventStore.getEvents()` filter parity: single-partition range, cross-partition range, no-filter |
+| **Live DB — single-partition EXPLAIN** | Bounded July query scans **only** `contract_events_y2026m07`; June and August partitions are pruned from the plan |
+| **Live DB — cross-partition EXPLAIN** | June-to-July range scans **exactly** `contract_events_y2026m06` and `contract_events_y2026m07`; August is pruned |
+| **Live DB — August-only EXPLAIN** | Bounded August query scans **only** `contract_events_y2026m08` |
+| **Live DB — store correctness** | `PostgresContractEventStore.getEvents()` returns the expected seed rows and excludes out-of-range rows |
+| **Live DB — ON CONFLICT idempotency** | Re-inserting an existing `(happened_at, event_id)` pair is a silent no-op (reported as `duplicateEventIds`) |
+
+#### Running the live tests
+
+```bash
+DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:5432/indexer_db \
+  pnpm test tests/db/contractEvents.partitionPruning.test.ts
+```
+
+Offline-only (no database):
+
+```bash
+pnpm test tests/db/contractEvents.partitionPruning.test.ts
+```
+
+#### `store.ts` — ON CONFLICT target
+
+Because `contract_events` is range-partitioned and its primary key is
+`(happened_at, event_id)`, the `INSERT … ON CONFLICT` clause in
+`PostgresContractEventStore.insertMany()` must specify **both** columns:
+
+```sql
+ON CONFLICT (happened_at, event_id) DO NOTHING
+```
+
+Using only `(event_id)` raises a PostgreSQL error
+(`there is no unique or exclusion constraint matching the ON CONFLICT
+specification`) on partitioned tables and was corrected as part of issue #932.
