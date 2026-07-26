@@ -293,6 +293,10 @@ export const EnvSchema = z.object({
    GRPC_HEALTH_ENABLED: booleanEnv().default(false),
    /** Port the gRPC health service binds to when enabled. Separate from PORT (HTTP). */
    GRPC_HEALTH_PORT: integerEnv('GRPC_HEALTH_PORT', 1, 65535).default(50051),
+   /** Enables the optional gRPC transcoding gateway for indexer communication. Default off. */
+   GRPC_GATEWAY_ENABLED: booleanEnv().default(false),
+   /** Port the gRPC indexer gateway binds to when enabled. */
+   GRPC_GATEWAY_PORT: integerEnv('GRPC_GATEWAY_PORT', 1, 65535).default(50052),
    INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
    INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
   DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
@@ -467,6 +471,10 @@ export interface Config {
   grpcHealthEnabled: boolean;
   /** Port the gRPC health service binds to when enabled. */
   grpcHealthPort: number;
+  /** Enables the optional gRPC transcoding gateway for indexer communication. */
+  grpcGatewayEnabled: boolean;
+  /** Port the gRPC indexer gateway binds to when enabled. */
+  grpcGatewayPort: number;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -646,6 +654,8 @@ function toConfig(env: ParsedEnv): Config {
     healthCheckIntervalMs: env.HEALTH_CHECK_INTERVAL_MS,
     grpcHealthEnabled: env.GRPC_HEALTH_ENABLED,
     grpcHealthPort: env.GRPC_HEALTH_PORT,
+    grpcGatewayEnabled: env.GRPC_GATEWAY_ENABLED,
+    grpcGatewayPort: env.GRPC_GATEWAY_PORT,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
