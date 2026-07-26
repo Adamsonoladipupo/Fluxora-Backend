@@ -832,3 +832,143 @@ describe('StreamHub broadcast mid-fan-out client disconnect', () => {
   });
 });
 
+
+describe('Rapid Resubscribe Flapping (#928)', () => {
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
+
+  const VALID_KEY = 'GCCFZVJYMLYWVOSZ63KUEAQSHYOYEEHZVNEK2EJBIEWJLDKAE6WFEGT7';
+
+  beforeEach(async () => {
+    ({ server, hub, port } = await setup());
+    _resetLimiter();
+  });
+
+  afterEach(async () => {
+    _resetLimiter();
+    await teardown(server, hub);
+  });
+
+  it('converges to the last processed message filter state under rapid flapping', async () => {
+    const result = await attemptConnect(port);
+    expect(result.success).toBe(true);
+    const ws = result.ws!;
+
+    const streamId = 'flapping-stream';
+    const streamId2 = 'another-stream';
+
+    // Send 20 messages rapidly (under rate limit MAX of 30)
+    // 0 to 19. i=19 is odd -> unsubscribe
+    const messages: Record<string, unknown>[] = [];
+    for (let i = 0; i < 20; i++) {
+      if (i % 2 === 0) {
+        messages.push({ type: 'subscribe', filter: { streamId } });
+      } else {
+        messages.push({ type: 'unsubscribe', filter: { streamId } });
+      }
+    }
+    
+    // Add one more subscribe for streamId2
+    messages.push({ type: 'subscribe', filter: { streamId: streamId2 } });
+
+    sendControlMessages(ws, messages);
+    await wait(200); // wait for messages to be processed
+
+    const streamMap = (hub as any).streamSubscriptions as Map<string, Set<WebSocket>>;
+
+    // streamId should be unsubscribed
+    expect(streamMap.has(streamId)).toBe(false);
+
+    // streamId2 should be subscribed
+    expect(streamMap.has(streamId2)).toBe(true);
+    expect(streamMap.get(streamId2)?.size).toBe(1);
+
+    const serverWs = Array.from((hub as any).clients.keys())[0] as WebSocket;
+    expect(streamMap.get(streamId2)?.has(serverWs)).toBe(true);
+
+    const clientState = (hub as any).clients.get(serverWs);
+    expect(clientState.subscriptionFilters.has(`stream:${streamId}`)).toBe(false);
+    expect(clientState.subscriptionFilters.has(`stream:${streamId2}`)).toBe(true);
+
+    await closeWs(ws);
+  });
+
+  /**
+   * SECURITY NOTE:
+   * Asserts the per-connection rate limiter (RATE_LIMIT_MAX/RATE_LIMIT_WINDOW_MS) 
+   * correctly throttles pathological flapping without corrupting subscription state.
+   */
+  it('correctly throttles pathological flapping via rate limiter without corrupting state', async () => {
+    const result = await attemptConnect(port);
+    expect(result.success).toBe(true);
+    const ws = result.ws!;
+
+    const streamId = 'pathological-stream';
+    const messageCount = RATE_LIMIT_MAX + 20;
+
+    const messages: Record<string, unknown>[] = [];
+    for (let i = 0; i < messageCount; i++) {
+      if (i % 2 === 0) {
+        messages.push({ type: 'subscribe', filter: { streamId } });
+      } else {
+        messages.push({ type: 'unsubscribe', filter: { streamId } });
+      }
+    }
+
+    sendControlMessages(ws, messages);
+    await wait(200);
+
+    const streamMap = (hub as any).streamSubscriptions as Map<string, Set<WebSocket>>;
+    
+    const lastProcessedIndex = RATE_LIMIT_MAX - 1;
+    const expectedSubscribe = (lastProcessedIndex % 2 === 0);
+    
+    expect(streamMap.has(streamId)).toBe(expectedSubscribe);
+    if (expectedSubscribe) {
+      expect(streamMap.get(streamId)?.has(ws)).toBe(true);
+    }
+    
+    // Second client: reversed logic
+    const result2 = await attemptConnect(port);
+    const ws2 = result2.ws!;
+    const messages2: Record<string, unknown>[] = [];
+    for (let i = 0; i < messageCount; i++) {
+      if (i % 2 === 0) {
+        messages2.push({ type: 'unsubscribe', filter: { streamId } });
+      } else {
+        messages2.push({ type: 'subscribe', filter: { streamId } });
+      }
+    }
+    
+    sendControlMessages(ws2, messages2);
+    await wait(200);    const expectedSubscribe2 = (lastProcessedIndex % 2 !== 0);
+
+    const serverSockets = Array.from((hub as any).clients.keys()) as WebSocket[];
+    const serverWs1 = serverSockets[0];
+    const serverWs2 = serverSockets[1];
+
+    if (!expectedSubscribe && !expectedSubscribe2) {
+      expect(streamMap.has(streamId)).toBe(false);
+    } else {
+      expect(streamMap.has(streamId)).toBe(true);
+    }
+
+    // Check that we didn't leak stale entries for client 1
+    if (expectedSubscribe) {
+      expect(streamMap.get(streamId)?.has(serverWs1)).toBe(true);
+    } else {
+      expect(streamMap.get(streamId)?.has(serverWs1)).toBeFalsy();
+    }
+
+    // Second client: reversed logic
+    if (expectedSubscribe2) {
+      expect(streamMap.get(streamId)?.has(serverWs2)).toBe(true);
+    } else {
+      expect(streamMap.get(streamId)?.has(serverWs2)).toBeFalsy();
+    }
+
+    await closeWs(ws);
+    await closeWs(ws2);
+  });
+});

@@ -20,3 +20,11 @@ export function recordWsBroadcastBatchFlushLatency(durationSeconds: number): voi
     wsBroadcastBatchFlushLatencySeconds.observe(durationSeconds);
   }
 }
+
+export function removeWsClientBackpressureGauge(connectionId: string): void {}
+export function collectWsBackpressureMetrics(hub: any, slowThresholdBytes: number): void {}
+export const DEFAULT_WS_BACKPRESSURE_INTERVAL_MS = 5000;
+export const DEFAULT_WS_SLOW_CLIENT_BYTES = 1048576;
+export const wsBatchFlushTotal = { inc: () => {} };
+export const wsBatchEventsCoalescedTotal = { inc: () => {} };
+export const wsBatchSizeExceededTotal = { inc: () => {} };
