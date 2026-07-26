@@ -500,6 +500,18 @@ Steps:
 
 ---
 
+**Integration Tests**
+
+- **Redis-backed adminStateLock integration:** Set `REDIS_INTEGRATION=true` and point `REDIS_TEST_URL` at a test Redis instance (for example a locally running `redis-server` or the compose `redis` service). Then run the specific test file:
+
+```bash
+REDIS_INTEGRATION=true REDIS_TEST_URL=redis://:fluxora_redis_password@127.0.0.1:6379 pnpm test tests/state/adminStateLock.concurrentReindex.test.ts
+```
+
+- Security: tests use transient Redis clients that are torn down after each test. Do not run against production Redis instances — use an isolated test instance only.
+
+---
+
 ### Rollback Procedure
 
 > Use this if errors are detected **after** cutover.  The old slot remains
