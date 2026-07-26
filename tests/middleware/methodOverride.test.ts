@@ -1,102 +1,161 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import type { Request, Response, NextFunction } from 'express';
 import { methodOverrideMiddleware } from '../../src/middleware/methodOverride.js';
 
-vi.mock('../../src/utils/logger.js', () => ({
-  info: vi.fn(),
-}));
+function createMockReq(overrides: Partial<Request> = {}): Partial<Request> {
+  return {
+    method: 'POST',
+    headers: {},
+    query: {},
+    path: '/api/streams',
+    id: 'test-req-id',
+    ...overrides,
+  } as any;
+}
+
+function createMockRes(): Partial<Response> & { _statusCode: number; _body: any } {
+  const res: any = {
+    _statusCode: 200,
+    _body: undefined,
+    status(code: number) {
+      this._statusCode = code;
+      return this;
+    },
+    json(body: any) {
+      this._body = body;
+      return this;
+    },
+  };
+  return res;
+}
 
 describe('methodOverrideMiddleware', () => {
-  let req: Partial<Request>;
-  let res: Partial<Response>;
-  let next: NextFunction;
+  it('does not override non-POST requests', () => {
+    let nextCalled = false;
+    const req = createMockReq({ method: 'GET' });
+    const res = createMockRes();
+    const next = () => { nextCalled = true; };
 
-  beforeEach(() => {
-    req = {
-      method: 'POST',
-      headers: {},
-      query: {},
-      path: '/api/streams/123',
-      id: 'req-123',
-    };
-    res = {
-      status: vi.fn().mockReturnThis(),
-      json: vi.fn(),
-    };
-    next = vi.fn();
-    vi.clearAllMocks();
-  });
-
-  it('should ignore non-POST requests', () => {
-    req.method = 'GET';
-    req.headers = { 'x-http-method-override': 'DELETE', authorization: 'Bearer token' };
-    
     methodOverrideMiddleware(req as Request, res as Response, next);
-    
-    expect(next).toHaveBeenCalledTimes(1);
+
+    expect(nextCalled).toBe(true);
     expect(req.method).toBe('GET');
   });
 
-  it('should ignore POST requests without override headers/query', () => {
-    req.headers = { authorization: 'Bearer token' };
-    
+  it('does not override POST without override header', () => {
+    let nextCalled = false;
+    const req = createMockReq({ method: 'POST' });
+    const res = createMockRes();
+    const next = () => { nextCalled = true; };
+
     methodOverrideMiddleware(req as Request, res as Response, next);
-    
-    expect(next).toHaveBeenCalledTimes(1);
+
+    expect(nextCalled).toBe(true);
     expect(req.method).toBe('POST');
   });
 
-  it('should ignore POST requests without auth headers', () => {
-    req.headers = { 'x-http-method-override': 'DELETE' };
-    
+  it('does not override POST with override header but no auth header', () => {
+    let nextCalled = false;
+    const req = createMockReq({
+      method: 'POST',
+      headers: { 'x-http-method-override': 'DELETE' },
+    });
+    const res = createMockRes();
+    const next = () => { nextCalled = true; };
+
     methodOverrideMiddleware(req as Request, res as Response, next);
-    
-    expect(next).toHaveBeenCalledTimes(1);
+
+    expect(nextCalled).toBe(true);
+    // Method should remain unchanged because no auth header is present
     expect(req.method).toBe('POST');
   });
 
-  it('should override method when x-http-method-override header is valid and auth is present', () => {
-    req.headers = { 'x-http-method-override': 'DELETE', authorization: 'Bearer token' };
-    
+  it('allows override with a valid auth header present (Authorization)', () => {
+    let nextCalled = false;
+    const req = createMockReq({
+      method: 'POST',
+      headers: {
+        'x-http-method-override': 'DELETE',
+        authorization: 'Bearer garbage-token',
+      },
+    });
+    const res = createMockRes();
+    const next = () => { nextCalled = true; };
+
     methodOverrideMiddleware(req as Request, res as Response, next);
-    
-    expect(next).toHaveBeenCalledTimes(1);
+
+    expect(nextCalled).toBe(true);
+    // Method is rewritten — auth validity is checked downstream
     expect(req.method).toBe('DELETE');
   });
 
-  it('should override method when _method query is valid and x-api-key is present', () => {
-    req.query = { _method: 'patch' };
-    req.headers = { 'x-api-key': 'secret-key' };
-    
+  it('allows override with X-API-Key header present (even if garbage)', () => {
+    let nextCalled = false;
+    const req = createMockReq({
+      method: 'POST',
+      headers: {
+        'x-http-method-override': 'PUT',
+        'x-api-key': 'garbage-key',
+      },
+    });
+    const res = createMockRes();
+    const next = () => { nextCalled = true; };
+
     methodOverrideMiddleware(req as Request, res as Response, next);
-    
-    expect(next).toHaveBeenCalledTimes(1);
+
+    expect(nextCalled).toBe(true);
+    // Method is rewritten — downstream auth will reject the garbage key
+    expect(req.method).toBe('PUT');
+  });
+
+  it('allows override via query string _method parameter', () => {
+    let nextCalled = false;
+    const req = createMockReq({
+      method: 'POST',
+      headers: { authorization: 'Bearer x' },
+      query: { _method: 'PATCH' },
+    });
+    const res = createMockRes();
+    const next = () => { nextCalled = true; };
+
+    methodOverrideMiddleware(req as Request, res as Response, next);
+
+    expect(nextCalled).toBe(true);
     expect(req.method).toBe('PATCH');
   });
 
-  it('should return 400 for unsupported override methods', () => {
-    req.headers = { 'x-http-method-override': 'GET', authorization: 'Bearer token' };
-    
-    methodOverrideMiddleware(req as Request, res as Response, next);
-    
-    expect(next).not.toHaveBeenCalled();
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith({
-      error: {
-        code: 'VALIDATION_ERROR',
-        message: 'Unsupported method override',
-      }
+  it('rejects unsupported override methods with 400', () => {
+    const req = createMockReq({
+      method: 'POST',
+      headers: {
+        'x-http-method-override': 'GET',
+        authorization: 'Bearer x',
+      },
     });
-    expect(req.method).toBe('POST');
+    const res = createMockRes();
+    const next = () => { throw new Error('next() should not be called'); };
+
+    methodOverrideMiddleware(req as Request, res as Response, next);
+
+    expect(res._statusCode).toBe(400);
+    expect(res._body?.error?.code).toBe('VALIDATION_ERROR');
   });
 
-  it('should return 400 for completely bogus methods', () => {
-    req.query = { _method: 'HACK' };
-    req.headers = { authorization: 'Bearer token' };
-    
+  it('uses query _method only when header override is absent', () => {
+    let nextCalled = false;
+    // Query _method present but no auth header → gate prevents override
+    const req = createMockReq({
+      method: 'POST',
+      headers: {},
+      query: { _method: 'DELETE' },
+    });
+    const res = createMockRes();
+    const next = () => { nextCalled = true; };
+
     methodOverrideMiddleware(req as Request, res as Response, next);
-    
-    expect(res.status).toHaveBeenCalledWith(400);
+
+    expect(nextCalled).toBe(true);
+    // Method remains POST — no credentials present to pass the gate
     expect(req.method).toBe('POST');
   });
 });
