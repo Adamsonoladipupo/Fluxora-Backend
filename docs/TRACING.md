@@ -412,8 +412,7 @@ TRACING_ENABLED=true pnpm test -- --benchmark
 3. **Sampling strategies** — Implement head-based sampling (consistent trace decision), tail-based sampling, and per-route overrides
    - Rationale: Reduce volume of traces in production while capturing interesting requests
 
-4. **Span export batch optimization** — Batch spans for more efficient export to backends
-   - Rationale: Reduce network calls and improve throughput to external collectors
+4. ~~**Span export batch optimization**~~ — **IMPLEMENTED** (issue #758). See the Span Export Batching section below.
 
 5. **Metrics dashboard** — Create Grafana/CloudWatch dashboard for span metrics
    - Rationale: Operational visibility without log parsing
@@ -823,3 +822,54 @@ See `tests/tracing/sampling.test.ts` for comprehensive coverage:
 - `shouldSampleTail` error retention and random sampling
 - `resolvePerRouteOverride` exact match, prefix match, fallback
 - `getSamplingConfig` env var parsing for all strategies
+
+---
+
+## Span Export Batching (issue #758)
+
+Fluxora implements a bounded, in-memory batch exporter (`BatchSpanExporter` in `src/tracing/hooks.ts`) for finished spans. Instead of making an individual network call to the OTLP collector on every span end, spans are accumulated into a buffer and exported in batches.
+
+### Key Guarantees & Features
+
+- **Non-blocking Execution**: `onSpanEnd` adds completed spans to the in-memory queue synchronously in O(1) time without awaiting HTTP/network I/O.
+- **Size-Threshold & Scheduled Flushing**: Spans are automatically flushed when either:
+  1. The buffered count reaches `maxBatchSize` (default: 512 spans).
+  2. The `scheduledDelayMs` timer (default: 5000 ms) expires.
+- **Bounded Memory & Overflow Fallback**: Queue size is capped at `maxQueueSize` (default: 2048 spans). If the queue becomes full, excess spans fall back to non-blocking direct export without blocking the request execution loop or consuming unbounded process memory.
+- **Graceful Shutdown**: Automatically registered with `addShutdownHook()` in `src/shutdown.ts`. During process shutdown, `stopTracing()` and `flush()` drain all queued spans before process termination, guaranteeing zero span loss on exit.
+- **Failure Resilience**: Errors or network timeouts during export handler execution are caught and recorded in operational metrics (`exportFailures`), never propagating exceptions to application code.
+
+### Configuration Reference
+
+Environment variables controlling batch export behavior:
+
+| Environment Variable | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | integer | `512` | Maximum number of spans in a single export batch |
+| `OTEL_BSP_SCHEDULED_DELAY_MILLIS` | integer | `5000` | Maximum time (ms) to wait before flushing buffered spans |
+| `OTEL_BSP_MAX_QUEUE_SIZE` | integer | `2048` | Maximum capacity of the in-memory span queue |
+
+`TRACING_BATCH_MAX_SIZE`, `TRACING_BATCH_TIMEOUT_MS`, and `TRACING_BATCH_QUEUE_SIZE` are supported as configuration aliases.
+
+### Code API
+
+```typescript
+import { BatchSpanExporter, createBatchSpanExporter } from './src/tracing/hooks.js';
+
+// Create custom batch exporter
+const batchExporter = createBatchSpanExporter({
+  maxBatchSize: 100,
+  scheduledDelayMs: 1000,
+  maxQueueSize: 1000,
+  exportHandler: async (spans) => {
+    await sendToOtlpCollector(spans);
+  },
+});
+
+// Flush all buffered spans manually
+await batchExporter.flush();
+
+// Shut down batch exporter (drains remaining queue)
+await batchExporter.shutdown();
+```
+

@@ -20,6 +20,12 @@ import type { ApiKeyRecord } from '../types.js';
 
 /** Map a raw pg row to a typed {@link ApiKeyRecord}. */
 function rowToRecord(row: Record<string, unknown>): ApiKeyRecord {
+  const scopes = Array.isArray(row['scopes'])
+    ? (row['scopes'] as string[])
+    : typeof row['scopes'] === 'string'
+      ? JSON.parse(row['scopes'] as string)
+      : ['streams:read', 'streams:write'];
+
   return {
     id:        row['id']     as string,
     name:      row['name']   as string,
@@ -29,10 +35,11 @@ function rowToRecord(row: Record<string, unknown>): ApiKeyRecord {
     createdAt: (row['created_at'] as Date).toISOString(),
     rotatedAt: row['rotated_at'] ? (row['rotated_at'] as Date).toISOString() : null,
     active:    row['active'] as boolean,
+    scopes:   (row['scopes'] as string[]) || [],
   };
 }
 
-const SELECT_COLUMNS = 'id, name, key_hash, salt, prefix, created_at, rotated_at, active';
+const SELECT_COLUMNS = 'id, name, key_hash, salt, prefix, created_at, rotated_at, active, scopes';
 
 // ── Repository ────────────────────────────────────────────────────────────────
 
@@ -42,8 +49,8 @@ export const apiKeyRepository = {
     const pool = getPool();
     await query(
       pool,
-      `INSERT INTO api_keys (id, name, key_hash, salt, prefix, created_at, rotated_at, active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      `INSERT INTO api_keys (id, name, key_hash, salt, prefix, created_at, rotated_at, active, scopes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         record.id,
         record.name,
@@ -53,6 +60,7 @@ export const apiKeyRepository = {
         record.createdAt,
         record.rotatedAt,
         record.active,
+        record.scopes,
       ],
     );
   },

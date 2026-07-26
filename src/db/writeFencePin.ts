@@ -47,6 +47,20 @@
  * `0` disables pin enforcement entirely (all reads go to replica/primary per
  * normal routing).
  *
+ * ## Clock-skew tolerance
+ *
+ * In multi-instance deployments, `issueWriteFencePin()` may run on one
+ * replica and `verifyWriteFencePin()` on another moments later.  If the
+ * verifier's wall clock is slightly behind the issuer's, `ageMs` can be
+ * briefly negative (`Date.now() - issuedAt < 0`) and a freshly issued pin
+ * would be rejected with a strict `ageMs < 0` check.
+ *
+ * Verification therefore allows a small **one-sided** leeway of
+ * {@link CLOCK_SKEW_TOLERANCE_MS} (2 s): pins that appear up to that far
+ * in the future are still honored.  The upper-bound TTL check is **not**
+ * loosened — expired pins remain rejected — so replay resistance is not
+ * meaningfully weakened.
+ *
  * @module db/writeFencePin
  */
 
@@ -63,6 +77,18 @@ export const WRITE_FENCE_HEADER = 'X-Fluxora-Write-Fence' as const;
  * applies.  30 s is generous for most replica lag configurations.
  */
 const DEFAULT_TTL_SECONDS = 30;
+
+/**
+ * Maximum negative `ageMs` (pin timestamp ahead of verifier clock) still
+ * accepted at verify time.
+ *
+ * Chosen small enough that it does not extend the effective TTL / replay
+ * window in any meaningful way, but large enough to absorb typical NTP
+ * jitter and brief cross-instance clock disagreement in multi-replica
+ * deployments.  Only softens the "issued in the future" edge — see module
+ * JSDoc "Clock-skew tolerance".
+ */
+export const CLOCK_SKEW_TOLERANCE_MS = 2_000;
 
 /** Protocol version embedded at the start of every pin. */
 const PIN_VERSION = 'v1' as const;
@@ -145,6 +171,11 @@ export function issueWriteFencePin(): string {
  * pin — callers should treat a `false` result as "use normal routing" rather
  * than as an error.
  *
+ * Pins whose embedded timestamp is slightly ahead of the verifier's clock
+ * (negative `ageMs` within {@link CLOCK_SKEW_TOLERANCE_MS}) are accepted so
+ * cross-instance clock skew does not drop a fresh fence.  Age beyond the
+ * configured TTL is still rejected strictly.
+ *
  * **Timing safety**: signature comparison uses `crypto.timingSafeEqual` so
  * the function does not leak key material through response timing.
  *
@@ -195,7 +226,11 @@ export function verifyWriteFencePin(
 
   const issuedAt = parseInt(tsMs, 10);
   const ageMs = Date.now() - issuedAt;
-  if (ageMs < 0 || ageMs > ttlSeconds * 1000) return false;
+  // One-sided skew leeway: allow a pin that looks slightly "in the future"
+  // (issuer clock ahead of verifier). Do not loosen the TTL upper bound.
+  if (ageMs < -CLOCK_SKEW_TOLERANCE_MS || ageMs > ttlSeconds * 1000) {
+    return false;
+  }
 
   // Derive expected signature
   let key: Buffer;

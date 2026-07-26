@@ -160,6 +160,65 @@ class ReplayState {
 
 export const replayState = new ReplayState();
 
+// ── Row mappers (pg QueryResultRow → domain types) ────────────────────────────
+//
+// Never pass a bare domain interface to `client.query<T>()`.  pg requires
+// `QueryResultRow` (an index signature); domain interfaces do not satisfy it.
+// Query with `Record<string, unknown>` and map through these helpers instead.
+// See `src/db/repositories/README.md`.
+
+function asNumber(value: unknown): number {
+  return Number(value);
+}
+
+function asNumberOrNull(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  return Number(value);
+}
+
+function asDate(value: unknown): Date {
+  return value instanceof Date ? value : new Date(String(value));
+}
+
+function asDateOrNull(value: unknown): Date | null {
+  if (value === null || value === undefined) return null;
+  return asDate(value);
+}
+
+/** Map a raw `replay_cursors` row into a typed {@link ReplayCursor}. */
+export function rowToReplayCursor(row: Record<string, unknown>): ReplayCursor {
+  return {
+    id:                    row['id'] as string,
+    contract_id:           row['contract_id'] as string,
+    ledger:                asNumber(row['ledger']),
+    from_block:            asNumberOrNull(row['from_block']),
+    to_block:              asNumberOrNull(row['to_block']),
+    total_rows:            asNumber(row['total_rows']),
+    last_committed_offset: asNumber(row['last_committed_offset']),
+    started_at:            asDate(row['started_at']),
+    completed_at:          asDateOrNull(row['completed_at']),
+  };
+}
+
+/** Map a raw `historical_events` / contract-event row into a typed {@link ContractEvent}. */
+export function rowToContractEvent(row: Record<string, unknown>): ContractEvent {
+  return {
+    event_id:         row['event_id'] as string,
+    contract_id:      row['contract_id'] as string,
+    ledger:           asNumber(row['ledger']),
+    event_type:       row['event_type'] as string,
+    event_data:       row['event_data'],
+    block_height:     asNumber(row['block_height']),
+    transaction_hash: row['transaction_hash'] as string,
+    ...(row['ingested_at'] !== undefined
+      ? { ingested_at: asDateOrNull(row['ingested_at']) }
+      : {}),
+    ...(row['created_at'] !== undefined
+      ? { created_at: asDate(row['created_at']) }
+      : {}),
+  };
+}
+
 // ── Cursor repository (DB operations) ─────────────────────────────────────────
 
 /**
@@ -179,7 +238,7 @@ export class ReplayCursorRepository {
     contractId: string,
     ledger: number,
   ): Promise<ReplayCursor | null> {
-    const result = await client.query<ReplayCursor>(
+    const result = await client.query<Record<string, unknown>>(
       `SELECT id, contract_id, ledger, from_block, to_block,
               total_rows, last_committed_offset, started_at, completed_at
          FROM replay_cursors
@@ -190,7 +249,7 @@ export class ReplayCursorRepository {
         LIMIT 1`,
       [contractId, ledger],
     );
-    return result.rows[0] ?? null;
+    return result.rows[0] ? rowToReplayCursor(result.rows[0]) : null;
   }
 
   /**
@@ -204,7 +263,7 @@ export class ReplayCursorRepository {
     toBlock: number | undefined,
     totalRows: number,
   ): Promise<ReplayCursor> {
-    const result = await client.query<ReplayCursor>(
+    const result = await client.query<Record<string, unknown>>(
       `INSERT INTO replay_cursors
          (contract_id, ledger, from_block, to_block, total_rows, last_committed_offset)
        VALUES ($1, $2, $3, $4, $5, 0)
@@ -212,7 +271,7 @@ export class ReplayCursorRepository {
                  total_rows, last_committed_offset, started_at, completed_at`,
       [contractId, ledger, fromBlock ?? null, toBlock ?? null, totalRows],
     );
-    return result.rows[0]!;
+    return rowToReplayCursor(result.rows[0]!);
   }
 
   /**
@@ -769,8 +828,8 @@ export class IndexerService {
     query += ` ORDER BY block_height ASC, event_id ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
 
-    const result = await client.query<ContractEvent>(query, params);
-    return result.rows;
+    const result = await client.query<Record<string, unknown>>(query, params);
+    return result.rows.map(rowToContractEvent);
   }
 
   /**

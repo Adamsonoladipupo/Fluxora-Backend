@@ -49,6 +49,9 @@ function safeUrl(value: string | undefined, fallback: string): string {
   }
 }
 
+import { addShutdownHook } from '../shutdown.js';
+import { getTracer } from './hooks.js';
+
 // ── SDK singleton ─────────────────────────────────────────────────────────────
 
 let sdk: NodeSDK | null = null;
@@ -97,6 +100,12 @@ export function startTracing(): boolean {
     });
 
     sdk.start();
+
+    // Register shutdown hook to flush all pending spans and stop SDK on exit
+    addShutdownHook(async () => {
+      await stopTracing();
+    });
+
     return true;
   } catch (err) {
     // SDK startup must never crash the application.
@@ -117,6 +126,13 @@ export function startTracing(): boolean {
  * Call during graceful shutdown before process.exit().
  */
 export async function stopTracing(): Promise<void> {
+  try {
+    const tracer = getTracer();
+    await tracer.flush();
+  } catch {
+    // ignore tracer flush errors
+  }
+
   if (!sdk) return;
   try {
     await sdk.shutdown();
@@ -213,4 +229,43 @@ export function getSamplingConfig(): SamplingConfig {
     ...(perRouteOverrides !== undefined ? { perRouteOverrides } : {}),
   };
   return config;
+}
+
+// ── Batch Span Exporter configuration ─────────────────────────────────────────
+
+export interface OTelBatchConfig {
+  maxExportBatchSize: number;
+  scheduledDelayMillis: number;
+  maxQueueSize: number;
+}
+
+/**
+ * Parse OpenTelemetry BatchSpanProcessor configuration from environment variables.
+ *
+ * Environment variables:
+ * - `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` or `TRACING_BATCH_MAX_SIZE` (default: 512)
+ * - `OTEL_BSP_SCHEDULED_DELAY_MILLIS` or `TRACING_BATCH_TIMEOUT_MS` (default: 5000)
+ * - `OTEL_BSP_MAX_QUEUE_SIZE` or `TRACING_BATCH_QUEUE_SIZE` (default: 2048)
+ */
+export function getOTelBatchConfig(): OTelBatchConfig {
+  const parseNum = (val: string | undefined, fallback: number, min = 1): number => {
+    if (!val || val.trim() === '') return fallback;
+    const n = parseInt(val, 10);
+    return Number.isFinite(n) && n >= min ? n : fallback;
+  };
+
+  return {
+    maxExportBatchSize: parseNum(
+      process.env.OTEL_BSP_MAX_EXPORT_BATCH_SIZE ?? process.env.TRACING_BATCH_MAX_SIZE,
+      512,
+    ),
+    scheduledDelayMillis: parseNum(
+      process.env.OTEL_BSP_SCHEDULED_DELAY_MILLIS ?? process.env.TRACING_BATCH_TIMEOUT_MS,
+      5000,
+    ),
+    maxQueueSize: parseNum(
+      process.env.OTEL_BSP_MAX_QUEUE_SIZE ?? process.env.TRACING_BATCH_QUEUE_SIZE,
+      2048,
+    ),
+  };
 }

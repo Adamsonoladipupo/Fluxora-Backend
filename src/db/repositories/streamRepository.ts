@@ -22,6 +22,10 @@
  *   logged or included in error messages.  Key rotation is supported via an
  *   optional PGCRYPTO_KEY_PREVIOUS.
  *
+ * Typed row mapping:
+ *   Never pass a bare domain interface to `query<T>()`. Query with
+ *   `Record<string, unknown>` and map through `rowToRecord()` (see README.md).
+ *
  * @module db/repositories/streamRepository
  */
 
