@@ -172,8 +172,8 @@ export function _resetLimiter(): void {
   connectionCounts.clear();
   rejectionHistory.clear();
   // Reset ban store state
-  if (banStore && typeof (banStore as any).close === 'function') {
-    void (banStore as any).close();
+  if (banStore) {
+    void banStore.close();
   }
   banStore = createBanStore();
 }
