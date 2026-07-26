@@ -291,6 +291,21 @@ export class Tracer {
   /**
    * Flush pending spans (for graceful shutdown).
    */
+
+  /**
+   * Finalize a span that was never explicitly ended (e.g. abandoned at shutdown).
+   * Sets endTimeMs, durationMs, and marks status as 'error' with a diagnostic message
+   * so downstream exporters never receive raw pending spans.
+   */
+  private finalizeSpan(span: Span): void {
+    if (span.status === 'pending') {
+      span.endTimeMs = Date.now();
+      span.durationMs = span.endTimeMs - span.startTimeMs;
+      span.status = 'error';
+      span.statusMessage = 'flushed at shutdown: never explicitly ended';
+    }
+  }
+
   async flush(): Promise<void> {
     if (this.config.hooks) {
       if (typeof this.config.hooks.flush === 'function') {
@@ -298,6 +313,7 @@ export class Tracer {
       }
       if (typeof this.config.hooks.onSpanEnd === 'function') {
         for (const span of this.activeSpans.values()) {
+          this.finalizeSpan(span);
           await new Promise<void>((resolve) => {
             this.safeCall(() => {
               const result: void | Promise<void> = this.config.hooks!.onSpanEnd?.(span);
@@ -307,6 +323,8 @@ export class Tracer {
                 resolve();
               }
             });
+          }
+          this.activeSpans.delete(span.context.spanId);
           });
         }
       }
@@ -1016,6 +1034,21 @@ export class BatchSpanExporter implements TracerHooks {
   /**
    * Flush all buffered spans in batches to the export handler.
    */
+
+  /**
+   * Finalize a span that was never explicitly ended (e.g. abandoned at shutdown).
+   * Sets endTimeMs, durationMs, and marks status as 'error' with a diagnostic message
+   * so downstream exporters never receive raw pending spans.
+   */
+  private finalizeSpan(span: Span): void {
+    if (span.status === 'pending') {
+      span.endTimeMs = Date.now();
+      span.durationMs = span.endTimeMs - span.startTimeMs;
+      span.status = 'error';
+      span.statusMessage = 'flushed at shutdown: never explicitly ended';
+    }
+  }
+
   async flush(): Promise<void> {
     this.clearTimer();
 
@@ -1118,3 +1151,5 @@ export function createBatchSpanExporter(
 ): BatchSpanExporter {
   return new BatchSpanExporter(config);
 }
+
+
