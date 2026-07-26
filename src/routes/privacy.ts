@@ -20,8 +20,8 @@ import {
   TRUST_BOUNDARIES,
   DataClassification,
 } from '../pii/policy.js';
-import { computeAddressHash } from '../pii/pgcryptoEncryption.js';
-import { getPool, query, PoolExhaustedError } from '../db/pool.js';
+import { computeAddressHash, DEFAULT_ERASURE_TOMBSTONE, redactPiiForAddress } from '../pii/pgcryptoEncryption.js';
+import { getPool, query, withClient, PoolExhaustedError } from '../db/pool.js';
 import { loadConfig } from '../config/env.js';
 import {
   PrivacyConsentSchema,
@@ -37,7 +37,7 @@ import {
 } from '../middleware/errorHandler.js';
 import { successResponse } from '../utils/response.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
-import { recordAuditEventToDb } from '../lib/auditLog.js';
+import { recordAuditEventToDb, recordErasureAuditLog } from '../lib/auditLog.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { logger } from '../lib/logger.js';
 
@@ -68,10 +68,9 @@ interface PrivacyConsentResponse {
  * request is fulfilled. The value is intentionally not a valid Stellar address
  * so it cannot be mistaken for real chain data.
  *
- * The prefix `[REDACTED:` is machine-readable; audit tools can scan for it.
- * The suffix `:GDPR-17]` references GDPR Article 17 (right to erasure).
+ * The prefix `[REDACTED_GDPR_ERASURE]` is machine-readable; audit tools can scan for it.
  */
-const ERASURE_TOMBSTONE = '[REDACTED:GDPR-17]';
+const ERASURE_TOMBSTONE = DEFAULT_ERASURE_TOMBSTONE;
 
 /**
  * Middleware: set security and cache headers on every privacy response.
@@ -291,7 +290,7 @@ privacyRouter.put(
     }
 
     const row = result!.rows[0];
-    res.status(200).json(successResponse({ consent: toConsentResponse(row!) }, req.id));
+    res.status(200).json(successResponse({ consent: toConsentResponse(row!) }, getCorrelationId()));
   }),
 );
 privacyRouter.all('/consent', rejectUnsupportedMethods(['PUT']));
@@ -332,7 +331,7 @@ privacyRouter.get(
     const row = result!.rows[0];
     if (!row) throw notFound('Privacy consent');
 
-    res.json(successResponse({ consent: toConsentResponse(row) }, req.id));
+    res.json(successResponse({ consent: toConsentResponse(row) }, getCorrelationId()));
   }),
 );
 privacyRouter.all('/consent/:address', rejectUnsupportedMethods(['GET', 'HEAD']));
@@ -393,6 +392,23 @@ function classificationDescription(level: DataClassification): string {
  *   403 — invalid credentials
  *   500 — internal error (audit entry still attempted)
  */
+/**
+ * Endpoint handler: DELETE /api/privacy/erasure/:recipientAddress
+ *
+ * Fulfils a GDPR Article 17 right-to-erasure request for a data subject
+ * identified by their Stellar recipient address.
+ *
+ * Requirements satisfied:
+ *  - Authorization: Restricted to admin and data-protection-officer roles.
+ *  - Validation: Validates recipientAddress format.
+ *  - PII Redaction: Replaces address PII columns with tombstone `[REDACTED_GDPR_ERASURE]` and clears hash columns.
+ *  - Financial Integrity: Preserves amounts, ledger, stream_id, status, and contract_events untouched.
+ *  - Audit Logging: Records `GDPR_ERASURE` and `PII_ERASURE_REQUESTED` audit events without storing erased PII.
+ *  - Transaction: Executes within a DB transaction with rollback on failure.
+ *
+ * @param req - Express Request containing recipientAddress parameter
+ * @param res - Express Response
+ */
 privacyRouter.delete(
   '/erasure/:recipientAddress',
   requireAdminAuth,
@@ -423,53 +439,62 @@ privacyRouter.delete(
     });
 
     const pool = getPool();
+    const requesterUser = (req as any).user;
+    const requesterRole = requesterUser?.role ?? 'admin';
+    const requestedBy = requesterUser?.address ?? (req.headers.authorization ?? '').substring(0, 16) + '…';
 
     try {
-      const result = await query(
-        pool,
-        `UPDATE streams
-            SET sender_address        = $1,
-                recipient_address     = $1,
-                sender_address_hash   = NULL,
-                recipient_address_hash = NULL
-          WHERE (recipient_address = $2 OR sender_address = $2)
-            AND COALESCE(legal_hold, FALSE) = FALSE`,
-        [ERASURE_TOMBSTONE, address],
-      );
+      let rowsErased = 0;
+      let rowsSkippedLegalHold = 0;
 
-      const rowsErased = result.rowCount ?? 0;
+      await withClient(pool, async (client) => {
+        await client.query('BEGIN');
 
-      const holdResult = await query(
-        pool,
-        `SELECT COUNT(*) AS cnt
-           FROM streams
-          WHERE (recipient_address = $1 OR sender_address = $1)
-            AND legal_hold = TRUE`,
-        [address],
-      );
-      const rowsSkippedLegalHold = parseInt(
-        (holdResult.rows[0] as { cnt: string } | undefined)?.cnt ?? '0',
-        10,
-      );
+        try {
+          const result = await redactPiiForAddress(client, address, ERASURE_TOMBSTONE);
+          rowsErased = result.rowsErased;
+          rowsSkippedLegalHold = result.rowsSkippedLegalHold;
 
-      try {
-        await recordAuditEventToDb(
-          'PII_ERASURE_REQUESTED',
-          'streams',
-          address.substring(0, 8) + '…',
-          correlationId,
-          {
-            rowsErased,
-            rowsSkippedLegalHold,
-            requestedBy: (req.headers.authorization ?? '').substring(0, 16) + '…',
-          },
-        );
-      } catch (auditErr) {
-        logger.error('Failed to write erasure audit entry', correlationId, {
-          event: 'pii_erasure_audit_failed',
-          error: auditErr instanceof Error ? auditErr.message : String(auditErr),
-        });
-      }
+          try {
+            await recordErasureAuditLog(
+              'GDPR_ERASURE',
+              'streams',
+              address,
+              correlationId,
+              {
+                requesterRole,
+                requestedBy,
+                outcome: 'success',
+                rowsErased,
+                rowsSkippedLegalHold,
+                action: 'GDPR_ERASURE',
+              },
+            );
+
+            await recordAuditEventToDb(
+              'PII_ERASURE_REQUESTED',
+              'streams',
+              address.substring(0, 8) + '…',
+              correlationId,
+              {
+                rowsErased,
+                rowsSkippedLegalHold,
+                requestedBy,
+              },
+            );
+          } catch (auditErr) {
+            logger.error('Failed to write erasure audit entry', correlationId, {
+              event: 'pii_erasure_audit_failed',
+              error: auditErr instanceof Error ? auditErr.message : String(auditErr),
+            });
+          }
+
+          await client.query('COMMIT');
+        } catch (txErr) {
+          await client.query('ROLLBACK');
+          throw txErr;
+        }
+      });
 
       logger.info('PII erasure completed', correlationId, {
         event: 'pii_erasure_completed',
@@ -494,6 +519,13 @@ privacyRouter.delete(
       });
 
       try {
+        await recordErasureAuditLog(
+          'GDPR_ERASURE',
+          'streams',
+          address,
+          correlationId,
+          { error: message, outcome: 'failed', requesterRole, requestedBy },
+        );
         await recordAuditEventToDb(
           'PII_ERASURE_REQUESTED',
           'streams',
