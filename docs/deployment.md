@@ -634,3 +634,166 @@ readinessProbe:
     port: 50051
   periodSeconds: 10
 ```
+
+
+---
+
+## Canary Routing
+
+Fluxora supports a deterministic, header-based canary traffic split. A
+configurable percentage of requests are tagged as canary by setting
+`req.isCanary = true` on the Express request object and echoing an
+`X-Fluxora-Canary: true` response header. This lets operators route, observe,
+and roll back canary builds without any client-side changes.
+
+### How it works
+
+The `canaryRoutingMiddleware` (`src/middleware/canaryRouting.ts`) runs
+immediately after the correlation-ID middleware so every canary-tagged request
+carries a traceable `x-correlation-id` through logs and metrics.
+
+**Decision algorithm (per request):**
+
+1. **Identify the client.** Prefers the `X-API-Key` request header (stable
+   across proxy/CDN topologies). Falls back to `req.ip` when no API key is
+   present.
+2. **Hash the identity.** Computes `SHA-256(CANARY_SALT + ':' + clientIdentity)`.
+3. **Derive a bucket.** Takes the first 8 hex digits of the digest, interprets
+   them as a `uint32`, and applies `% 100` to yield a value in `[0, 100)`.
+4. **Apply the threshold.** Tags the request as canary when
+   `bucket < CANARY_TRAFFIC_PERCENT`.
+
+The decision is a pure function of `(clientIdentity, CANARY_SALT,
+CANARY_TRAFFIC_PERCENT)` — the same client always lands in the same bucket for
+the lifetime of a deployment.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CANARY_TRAFFIC_PERCENT` | `0` | Integer `0–100`. Percentage of clients to route to the canary path. `0` disables canary tagging entirely. |
+| `CANARY_SALT` | `canary-routing-v1` | Arbitrary string used to namespace the hash. Change this between unrelated experiments to avoid correlated bucketing. **Never log this value.** |
+
+The `CANARY_TRAFFIC_PERCENT` value is validated by the Zod config schema
+(`src/config/env.ts`) to be an integer in `[0, 100]`. Out-of-range values
+cause a `ConfigError` at startup.
+
+### Observability
+
+**Response header** — `X-Fluxora-Canary: true` is set on every canary-tagged
+response. Absent on non-canary responses. Useful for:
+- Load-balancer routing rules (e.g. route `X-Fluxora-Canary: true` to the
+  canary upstream).
+- Integration test assertions.
+- Browser devtools or curl inspection during manual verification.
+
+**Structured logs** — The middleware emits a `debug`-level log for every
+canary-tagged request:
+
+```json
+{
+  "level": "debug",
+  "message": "Canary routing: request tagged as canary",
+  "correlationId": "<uuid>",
+  "component": "canary-routing",
+  "bucket": 23,
+  "trafficPercent": 30
+}
+```
+
+The `bucket` field enables operators to verify the distribution is as expected.
+The raw client identity (API key or IP) is **never** included in logs.
+
+**Prometheus metrics** — The existing `http_requests_total` and
+`http_request_duration_seconds` counters (emitted by `httpMetrics`) record
+all requests regardless of canary status. To split metrics by canary, add a
+custom label in your route handlers using `req.isCanary`:
+
+```typescript
+import type { Request, Response } from 'express';
+
+router.get('/api/feature', (req: Request, res: Response) => {
+  myCounter.inc({ canary: String(req.isCanary ?? false) });
+  // ...
+});
+```
+
+### Security considerations
+
+- The **raw client identity** (API key or IP address) is hashed before the
+  bucket computation and is **never stored or logged** by the middleware.
+- The **salt** (`CANARY_SALT`) is read from the environment and never
+  reflected in any log record or response header.
+- The salt is **intentionally different** from any feature-flag hash salt to
+  prevent correlated bucketing between independent experiments. Using the same
+  salt for two experiments means the same clients opt-in to both, which
+  confounds A/B measurement.
+- The `X-Fluxora-Canary` response header reveals only the canary decision
+  (`true`), not the client identity or bucket value.
+
+### Operator runbook
+
+#### Enable canary for 10 % of traffic
+
+```bash
+# Rolling deploy — set on the canary pod only
+CANARY_TRAFFIC_PERCENT=10
+CANARY_SALT=canary-routing-v1   # keep default unless running two experiments
+```
+
+Verify with:
+
+```bash
+# Find a client that lands in the canary bucket
+curl -I https://api.example.com/health -H 'X-API-Key: <key>'
+# Look for: X-Fluxora-Canary: true
+```
+
+#### Increase to 50 %
+
+```bash
+CANARY_TRAFFIC_PERCENT=50
+```
+
+Because the hash is stable, clients already in the canary set at 10 % remain
+in the canary set at 50 %. No client "flips" unexpectedly.
+
+#### Disable canary (full rollback)
+
+```bash
+CANARY_TRAFFIC_PERCENT=0
+```
+
+Setting to `0` short-circuits the hash computation entirely. All requests get
+`req.isCanary = false` with zero overhead.
+
+#### Run a second, independent experiment
+
+Use a different salt so the two experiments' buckets are uncorrelated:
+
+```bash
+# Experiment A — already running
+CANARY_TRAFFIC_PERCENT=20
+CANARY_SALT=experiment-a-v1
+
+# Experiment B — independent
+# Deploy a separate flag or use a different env variable pattern
+CANARY_SALT=experiment-b-v1
+```
+
+### Testing
+
+The middleware's unit and integration tests live in
+`tests/middleware/canaryRouting.test.ts`. Run them with:
+
+```bash
+pnpm test tests/middleware/canaryRouting.test.ts
+```
+
+Key assertions:
+- `computeCanaryBucket` is deterministic and matches the reference formula.
+- `resolveClientIdentity` prefers API key over IP.
+- `req.isCanary` is set correctly for the disabled, partial, and full-split cases.
+- `X-Fluxora-Canary` header is echoed only on canary responses.
+- Raw client identity and salt are never present in log calls.
+- `createApp()` integration confirms the header is visible on real HTTP responses.

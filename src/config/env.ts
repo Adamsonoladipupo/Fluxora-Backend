@@ -348,6 +348,14 @@ export const EnvSchema = z.object({
   STARTUP_PROBE_POSTGRES_TIMEOUT_MS: integerEnv('STARTUP_PROBE_POSTGRES_TIMEOUT_MS', 1).default(5_000),
   STARTUP_PROBE_REDIS_TIMEOUT_MS: integerEnv('STARTUP_PROBE_REDIS_TIMEOUT_MS', 1).default(3_000),
   STARTUP_PROBE_STELLAR_TIMEOUT_MS: integerEnv('STARTUP_PROBE_STELLAR_TIMEOUT_MS', 1).default(5_000),
+
+  /**
+   * Percentage of traffic (0–100) to route through the canary code path.
+   * 0 disables canary tagging entirely (default). Set to e.g. 10 to tag
+   * 10 % of clients deterministically as canary based on a SHA-256 hash
+   * of their identity (API key or IP).
+   */
+  CANARY_TRAFFIC_PERCENT: integerEnv('CANARY_TRAFFIC_PERCENT', 0, 100).default(0),
 }).passthrough().superRefine((env, ctx) => {
   const stellarNetwork = resolvedStellarNetwork(env);
   const expectedPassphrase = STELLAR_NETWORK_PASSPHRASES[stellarNetwork];
@@ -501,6 +509,12 @@ export interface Config {
   startupProbeRedisTimeoutMs: number;
   /** Per-attempt timeout for each Stellar RPC (soft-tier) retry attempt, ms. */
   startupProbeStellarTimeoutMs: number;
+
+  /**
+   * Percentage of traffic (0–100) to tag as canary.
+   * 0 means no canary tagging. Sourced from CANARY_TRAFFIC_PERCENT.
+   */
+  canaryTrafficPercent: number;
 }
 
 export class ConfigError extends Error {
@@ -672,6 +686,8 @@ function toConfig(env: ParsedEnv): Config {
     startupProbePostgresTimeoutMs: env.STARTUP_PROBE_POSTGRES_TIMEOUT_MS,
     startupProbeRedisTimeoutMs: env.STARTUP_PROBE_REDIS_TIMEOUT_MS,
     startupProbeStellarTimeoutMs: env.STARTUP_PROBE_STELLAR_TIMEOUT_MS,
+
+    canaryTrafficPercent: env.CANARY_TRAFFIC_PERCENT,
   };
 }
 
