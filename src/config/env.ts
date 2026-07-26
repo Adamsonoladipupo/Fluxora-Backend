@@ -379,6 +379,32 @@ export const EnvSchema = z.object({
       message: 'API_KEY_PEPPER is required when API_KEYS is configured',
     });
   }
+
+  if (env.NODE_ENV === 'production') {
+    if (env.LOG_LEVEL === 'debug') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['LOG_LEVEL'],
+        message: 'LOG_LEVEL must not be "debug" in production',
+      });
+    }
+
+    if (env.CORS_ALLOWED_ORIGINS !== undefined && env.CORS_ALLOWED_ORIGINS.includes('*')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['CORS_ALLOWED_ORIGINS'],
+        message: 'CORS_ALLOWED_ORIGINS must not contain a wildcard "*" origin in production',
+      });
+    }
+
+    if (env.PGCRYPTO_KEY === undefined || env.PGCRYPTO_KEY.length < 32) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PGCRYPTO_KEY'],
+        message: 'PGCRYPTO_KEY is required in production (minimum 32 characters)',
+      });
+    }
+  }
 });
 
 type ParsedEnv = z.infer<typeof EnvSchema>;
