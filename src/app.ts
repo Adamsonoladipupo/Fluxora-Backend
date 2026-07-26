@@ -266,15 +266,17 @@ export function createApp(options: AppOptions = {}): Express {
   void wireAdminStateLock(appConfig);
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
+  // Correlation ID must run before express.json() so req.correlationId is available
+  // even when JSON parsing throws and the error handler fires immediately.
+  // It must also run before early-reject middlewares (body size, content type) 
+  // so that rejected requests still carry a correlation ID.
+  app.use(correlationIdMiddleware);
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);
-  // Correlation ID must run before express.json() so req.correlationId is available
-  // even when JSON parsing throws and the error handler fires immediately.
-  app.use(correlationIdMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
