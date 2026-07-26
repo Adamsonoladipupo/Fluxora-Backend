@@ -30,7 +30,7 @@ function logFallback(operation: string, streamId: string, eventId: string): void
   const now = Date.now();
   if (now - lastFallbackLog >= FALLBACK_LOG_THROTTLE_MS) {
     lastFallbackLog = now;
-    logger.debug('dedup:fallback', { operation, streamId, eventId });
+    logger.debug('dedup:fallback', undefined, { operation, streamId, eventId });
   }
 }
 
@@ -133,6 +133,13 @@ export class HybridDedupCache implements DedupCache {
     async add(streamId: string, eventId: string): Promise<boolean> {
         if (this.useRedis) {
             try {
+                const inFallback = await this.fallback.has(streamId, eventId);
+                if (inFallback) {
+                    try {
+                        await this.primary.add(streamId, eventId);
+                    } catch {}
+                    return false;
+                }
                 const added = await this.primary.add(streamId, eventId);
                 if (added) await this.fallback.add(streamId, eventId);
                 return added;

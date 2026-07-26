@@ -16,6 +16,13 @@ declare global {
       apiVersion?: string;
       /** Attached by enforceStreamScope middleware; the normalized caller address. */
       callerAddress?: string;
+      /**
+       * Attached by canaryRoutingMiddleware.
+       * `true`  — this request falls within the canary traffic slice.
+       * `false` — this request is on the stable traffic slice.
+       * `undefined` — middleware has not yet run (e.g. very early in the stack).
+       */
+      isCanary?: boolean;
     }
   }
 }

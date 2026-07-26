@@ -240,6 +240,32 @@ describe('reloadFlags', () => {
     expect(getFlags().has('bad_flag')).toBe(false);
     expect(getFlags().has('ok_flag')).toBe(true);
   });
+
+  it('loads object-form flag definitions', async () => {
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify({
+      object_flag: { percentage: 100, description: 'Object style' },
+      shorthand_flag: 100,
+    });
+    const { isEnabled, reloadFlags, getFlags } = await import('../../src/config/featureFlags.js');
+    reloadFlags();
+    expect(isEnabled('object_flag', 'user-1')).toBe(true);
+    expect(isEnabled('shorthand_flag', 'user-1')).toBe(true);
+    expect(getFlags().get('object_flag')?.description).toBe('Object style');
+  });
+});
+
+describe('getRolloutBucket', () => {
+  it('returns a stable bucket for the same flag and requester', async () => {
+    const { getRolloutBucket } = await import('../../src/config/featureFlags.js');
+    expect(getRolloutBucket('streams_enhanced_response', 'key:abc')).toBe(
+      getRolloutBucket('streams_enhanced_response', 'key:abc'),
+    );
+  });
+
+  it('uses independent buckets per flag', async () => {
+    const { getRolloutBucket } = await import('../../src/config/featureFlags.js');
+    expect(getRolloutBucket('flag_a', 'key:abc')).not.toBe(getRolloutBucket('flag_b', 'key:abc'));
+  });
 });
 
 describe('FEATURE_FLAGS_FILE loading', () => {

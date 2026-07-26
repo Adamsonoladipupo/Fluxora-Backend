@@ -8,7 +8,7 @@ import { auditRouter } from './routes/audit.js';
 import { adminRouter } from './routes/admin.js';
 import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
-import { webhooksRouter } from './routes/webhooks.js';
+import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
 import { privacyHeaders } from './middleware/pii.js';
 import type { Config } from './config/env.js';
@@ -41,6 +41,7 @@ import { requireJsonContentType } from './middleware/contentType.js';
 import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
+import { canaryRoutingMiddleware } from './middleware/canaryRouting.js';
 import { serverTimingMiddleware } from './middleware/serverTiming.js';
 import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
@@ -182,6 +183,46 @@ async function wireStreamEventDedupCache(config: Config): Promise<void> {
       },
     );
     setDedupCache(new InMemoryDedupCache());
+  }
+}
+
+async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info('Redis disabled — inbound webhook dedup will use in-memory cache');
+    setInboundWebhookDedupCache(new InMemoryDedupCache());
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    const primary = new RedisDedupCache(redisClient);
+    const fallback = new InMemoryDedupCache();
+    const hybrid = new HybridDedupCache(primary, fallback, true);
+
+    setInboundWebhookDedupCache(hybrid);
+    addShutdownHook(() => hybrid.close());
+
+    logger.info('Redis inbound webhook dedup cache wired', undefined, {
+      component: 'inbound-webhook-dedup',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for inbound webhook dedup — falling back to in-memory cache',
+      undefined,
+      {
+        component: 'inbound-webhook-dedup',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    setInboundWebhookDedupCache(new InMemoryDedupCache());
   }
 }
 
@@ -385,6 +426,7 @@ export function createApp(options: AppOptions = {}): Express {
   const appConfig = options.config ?? loadConfig();
   void wireIdempotencyStore(appConfig);
   void wireStreamEventDedupCache(appConfig);
+  void wireInboundWebhookDedupCache(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
   void wireAdminStateLock(appConfig);
   void wireIndexerLeaderElection(appConfig);
@@ -419,6 +461,9 @@ export function createApp(options: AppOptions = {}): Express {
   // It must also run before early-reject middlewares (body size, content type) 
   // so that rejected requests still carry a correlation ID.
   app.use(correlationIdMiddleware);
+  // Canary routing runs immediately after correlation-ID assignment so that
+  // every canary-tagged request carries a correlation ID end-to-end in logs.
+  app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());

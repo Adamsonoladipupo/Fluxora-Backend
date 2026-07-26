@@ -104,6 +104,15 @@ that supports percentage-based rollout with deterministic per-requester bucketin
 ]
 ```
 
+Object form is also accepted for operator-managed config files:
+
+```json
+{
+  "streams_enhanced_response": { "percentage": 20, "description": "Enable enhanced response fields" },
+  "new_feature": 0
+}
+```
+
 Fields:
 - `name` — unique string identifier for the flag.
 - `percentage` — integer 0–100. 0 = disabled for all, 100 = enabled for all.
@@ -111,9 +120,13 @@ Fields:
 
 ### Determinism guarantee
 
-The rollout decision is computed as `FNV-1a32(flagName + ':' + requesterId) % 100 < percentage`.
+The rollout decision is computed from `SHA-256(flagName + requesterId) % 100 < percentage`.
 The same requester always receives the same decision for a given flag and percentage,
 without any shared state or random number generation, across all replicas.
+
+For stream routes, the requester id is resolved from the authenticated API key id
+when present, then the `X-API-Key` header, then the client IP. API keys are only
+used as hash input and are not logged or returned in responses.
 
 ---
 
