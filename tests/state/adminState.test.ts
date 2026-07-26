@@ -183,6 +183,31 @@ describe('adminState', () => {
       await acquired.release();
       await lock.release();
     });
+
+    it('RedisDistributedLock backed by NoOpRedisClient acquires immediately (single-process semantics)', async () => {
+      // NoOpRedisClient.setNx() returns true — simulating an uncontended
+      // single-process lock. The lock should be acquired on the first attempt.
+      const lock = new RedisDistributedLock(new NoOpRedisClient(), 'noOpTest', { timeoutMs: 100 });
+      const acquired = await lock.acquire();
+      expect(acquired).toBeDefined();
+      expect(typeof acquired.release).toBe('function');
+      await acquired.release();
+    });
+
+    it('RedisDistributedLock with NoOpRedisClient can acquire and release repeatedly', async () => {
+      // Each acquire call should succeed because NoOpRedisClient.setNx
+      // simulates an always-uncontended lock. This is correct for no-Redis
+      // single-process mode where in-process state guards provide exclusion.
+      const lock = new RedisDistributedLock(new NoOpRedisClient(), 'noOpRepeated', { timeoutMs: 100 });
+
+      const a = await lock.acquire();
+      expect(typeof a.release).toBe('function');
+      await a.release();
+
+      const b = await lock.acquire();
+      expect(typeof b.release).toBe('function');
+      await b.release();
+    });
   });
 
   describe('reindex', () => {

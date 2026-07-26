@@ -312,11 +312,25 @@ export function _resetRedisClientRegistry(): void {
 
 // ---------------------------------------------------------------------------
 // NoOpRedisClient — used when Redis is disabled
+//
+// This is the single canonical no-op Redis client for "Redis unavailable"
+// scenarios (development, single-process, or when REDIS_ENABLED=false).
+//
+// Semantics:
+// - setNx() returns `true` (always succeeds) because in a single-process /
+//   no-Redis environment there is no other instance to contend with, so lock
+//   acquisition should succeed immediately. Callers that need single-process
+//   mutual exclusion (e.g. adminState) rely on in-process guards (fast-path
+//   status checks) in addition to this lock, so the "always succeeds" behaviour
+//   is correct and deliberate for this mode.
+// - exists() returns `false` (nothing exists in no-op storage).
+// - get() returns `null` (nothing stored).
 // ---------------------------------------------------------------------------
 
 export class NoOpRedisClient implements RedisClient {
   async get(): Promise<string | null> { return null; }
   async set(): Promise<void> { return; }
+  /** Always returns true — simulates an uncontended single-process lock. */
   async setNx(): Promise<boolean> { return true; }
   async del(): Promise<void> { return; }
   async exists(): Promise<boolean> { return false; }
