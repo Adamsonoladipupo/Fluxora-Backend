@@ -26,7 +26,7 @@
 
 import { logger } from './logger.js';
 
-export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'MTLS_VALIDATION_FAILED';
 
 /**
  * Minimal prepare/run shape used by {@link writeAuditEntryToDb}.

@@ -30,3 +30,15 @@ export const httpRequestDurationSeconds = new Histogram({
   buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
   registers: [registry],
 });
+
+/**
+ * Total mTLS client-certificate validation failures for the indexer worker connection.
+ * Operators can alert on this counter as repeated failures indicate misconfiguration or an active attack.
+ */
+export const indexerMtlsValidationFailuresTotal = new Counter({
+  name: 'indexer_mtls_validation_failures_total',
+  help: 'Total number of mTLS client-certificate validation failures for the indexer worker',
+  labelNames: ['reason'] as const,
+  registers: [registry],
+});
+
