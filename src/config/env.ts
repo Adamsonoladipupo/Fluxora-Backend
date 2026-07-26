@@ -707,6 +707,19 @@ export function resetConfig(): void {
   configInstance = null;
 }
 
+/**
+ * Reset the startup env snapshot back to null.
+ *
+ * **FOR TESTING ONLY.** Allows each test to exercise
+ * `captureStartupEnvSnapshot()` / `reloadHotConfig()` in isolation without
+ * full module reloading. Never call this in production code.
+ *
+ * @internal
+ */
+export function resetStartupEnvSnapshot(): void {
+  startupEnvSnapshot = null;
+}
+
 // ─── Hot-reload support ───────────────────────────────────────────────────────
 
 /**
