@@ -58,6 +58,8 @@ export const transitionsTotal =
     registers: [registry],
   });
 
+export { webhookRateLimiterFailOpenTotal } from './webhookRateLimit.js';
+
 function closed(): WebhookCircuitBreakerRecord {
   return { state: 'closed', consecutiveFailures: 0, resetAt: 0 };
 }

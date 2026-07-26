@@ -11,6 +11,7 @@ import type { RedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 
 export interface Lock {
+  acquire(): Promise<Lock>;
   release(): Promise<void>;
 }
 
@@ -42,7 +43,7 @@ export interface RedisDistributedLockOptions {
   timeoutMs?: number;
 }
 
-export class RedisDistributedLock {
+export class RedisDistributedLock implements Lock {
   private readonly timeoutMs: number;
 
   constructor(
@@ -67,6 +68,7 @@ export class RedisDistributedLock {
         const acquired = await this.redis.setNx(lockKey, lockValue, this.timeoutMs);
         if (acquired) {
           return {
+            acquire: async () => this.acquire(),
             release: async () => {
               try {
                 await this.redis.del(lockKey);
@@ -96,6 +98,21 @@ export class RedisDistributedLock {
     );
   }
 
+  /**
+   * Release the distributed lock for this instance's namespace directly.
+   */
+  async release(): Promise<void> {
+    const lockKey = `${LOCK_KEY_PREFIX}${this.lockNamespace}`;
+    try {
+      await this.redis.del(lockKey);
+    } catch (err) {
+      logger.warn('Failed to release admin state lock', undefined, {
+        lockKey,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private async _acquireFileLock(): Promise<Lock> {
     const lockFile = `/tmp/fluxora-admin-state-${this.lockNamespace}.lock`;
 
@@ -106,6 +123,7 @@ export class RedisDistributedLock {
         fs.closeSync(fd);
 
         return {
+          acquire: async () => this.acquire(),
           release: async () => {
             try {
               fs.rmSync(lockFile, { force: true });
@@ -137,6 +155,10 @@ export class RedisDistributedLock {
  * No-op lock for when locking is disabled or unavailable.
  */
 export class NoOpLock implements Lock {
+  async acquire(): Promise<Lock> {
+    return this;
+  }
+
   async release(): Promise<void> {
     return;
   }

@@ -72,7 +72,7 @@ import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
 import { sendEarlyHints } from '../utils/earlyHints.js';
-import { streamRepository } from '../db/repositories/streamRepository.js';
+import { streamRepository, StatusConflictError } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
 import {
   issueWriteFencePin,
@@ -408,8 +408,8 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   };
 }
 
-function fingerprintInput(input: NormalizedCreateInput): string {
-  return crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
+export function fingerprintInput(input: NormalizedCreateInput): string {
+  return crypto.createHash('sha256').update(canonicalizeBody(input)).digest('hex');
 }
 
 /** Wrap DB errors so pool exhaustion surfaces as 503. */
@@ -486,7 +486,7 @@ streamsRouter.get(
   authenticateApiKey,
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id as string | undefined;
+    const requestId = req.correlationId as string | undefined;
 
     // Validate all query params in one pass via Zod
     const parsed = PaginationSchema.safeParse(req.query);
@@ -782,7 +782,7 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     if (!id) {
       throw notFound('Stream', '');
     }
@@ -877,7 +877,7 @@ streamsRouter.post(
   requireScope('streams:write'),
   requireIdempotencyKey,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id;
+    const requestId = req.correlationId;
     const correlationId = req.correlationId;
     const idempotencyKey = parseIdempotencyKeyHeader(req.header('Idempotency-Key'));
 
@@ -1021,7 +1021,7 @@ streamsRouter.delete(
   requireScope('streams:write'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     if (!id) {
       throw notFound('Stream', '');
     }
@@ -1047,6 +1047,18 @@ streamsRouter.delete(
     try {
       await streamRepository.updateStream(id, { status: 'cancelled' }, requestId ?? '');
     } catch (err) {
+      if (err instanceof StatusConflictError) {
+        throw new ApiError(
+          ApiErrorCode.CONFLICT,
+          err.message,
+          409,
+          {
+            streamId: id,
+            currentStatus: record!.status,
+            requestedStatus: 'cancelled',
+          },
+        );
+      }
       wrapDbError(err);
     }
 
@@ -1069,7 +1081,7 @@ streamsRouter.patch(
   '/:id/status',
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     const { status: newStatus } = req.body ?? {};
 
     if (!id) {
@@ -1104,6 +1116,18 @@ streamsRouter.patch(
       const dbStatus = newStatus as StreamStatus;
       updated = await streamRepository.updateStream(id, { status: dbStatus }, requestId ?? '');
     } catch (err) {
+      if (err instanceof StatusConflictError) {
+        throw new ApiError(
+          ApiErrorCode.CONFLICT,
+          err.message,
+          409,
+          {
+            streamId: id,
+            currentStatus: record!.status,
+            requestedStatus: newStatus,
+          },
+        );
+      }
       wrapDbError(err);
     }
 
@@ -1126,7 +1150,7 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
 
     if (!id) {
       throw notFound('Stream', '');

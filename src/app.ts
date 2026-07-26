@@ -41,7 +41,9 @@ import { requireJsonContentType } from './middleware/contentType.js';
 import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
+import { canaryRoutingMiddleware } from './middleware/canaryRouting.js';
 import { serverTimingMiddleware } from './middleware/serverTiming.js';
+import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
 import { drainSseEventBus } from './streams/sseEmitter.js';
@@ -388,6 +390,11 @@ export function createApp(options: AppOptions = {}): Express {
   void wireAdminStateLock(appConfig);
   void wireIndexerLeaderElection(appConfig);
 
+  // Configure mTLS enforcement for indexer worker connections.
+  // When INDEXER_MTLS_REQUIRED is true (default in production), non-TLS
+  // connections are rejected (fail-closed).
+  setMtlsRequired(appConfig.indexerMtlsRequired);
+
   // Optional grpc.health.v1.Health service for Kubernetes-native gRPC probes,
   // on a separate port from the HTTP server so it never competes with API
   // traffic. Requires a healthManager (same dependency-check logic as
@@ -408,15 +415,20 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(deploymentSlotMiddleware);
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
+  // Correlation ID must run before express.json() so req.correlationId is available
+  // even when JSON parsing throws and the error handler fires immediately.
+  // It must also run before early-reject middlewares (body size, content type) 
+  // so that rejected requests still carry a correlation ID.
+  app.use(correlationIdMiddleware);
+  // Canary routing runs immediately after correlation-ID assignment so that
+  // every canary-tagged request carries a correlation ID end-to-end in logs.
+  app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);
-  // Correlation ID must run before express.json() so req.correlationId is available
-  // even when JSON parsing throws and the error handler fires immediately.
-  app.use(correlationIdMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
   app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
@@ -471,7 +483,7 @@ export function createApp(options: AppOptions = {}): Express {
   });
 
   app.use((req: Request, res: Response) => {
-    const requestId = req.correlationId ?? req.id;
+    const requestId = req.correlationId;
     res.status(404).json(
       errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId),
     );

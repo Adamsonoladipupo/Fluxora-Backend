@@ -10,6 +10,7 @@
  *   5. Security assumptions — HMAC forging, replay after TTL, constant-time
  *   6. Edge cases — boundary timestamps, RYW_PIN_TTL_SECONDS=0, missing env
  *   7. streamRepository.findWithCursor options forwarding (forcePrimary)
+ *   8. Clock-skew tolerance — future timestamps within/beyond leeway (#831)
  *
  * @module tests/db/replicaPool.readYourWrites.test.ts
  */
@@ -54,6 +55,7 @@ import {
   verifyWriteFencePin,
   shouldForcePrimaryFromHeaders,
   WRITE_FENCE_HEADER,
+  CLOCK_SKEW_TOLERANCE_MS,
 } from '../../src/db/writeFencePin.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,7 +214,8 @@ describe('writeFencePin', () => {
       expect(verifyWriteFencePin(pin)).toBe(true);
     });
 
-    it('returns false for a pin with a future timestamp (clock skew / replay guard)', () => {
+    it('returns false for a pin far in the future (beyond clock-skew tolerance)', () => {
+      // Well beyond CLOCK_SKEW_TOLERANCE_MS — must still reject.
       const futureMs = (Date.now() + 10_000).toString();
       const sig = makeHmac(VALID_SECRET, 'v1', futureMs);
       const pin = buildPin('v1', futureMs, sig);
@@ -358,6 +361,58 @@ describe('writeFencePin', () => {
     it('returns false when JWT_SECRET is too short at verification time', () => {
       const pin = issueWriteFencePin();
       process.env['JWT_SECRET'] = 'short';
+      expect(verifyWriteFencePin(pin)).toBe(false);
+    });
+  });
+
+  // ── Clock-skew tolerance (#831) ───────────────────────────────────────────
+
+  describe('clock-skew tolerance (issue/verify across instances)', () => {
+    it('exports a small positive CLOCK_SKEW_TOLERANCE_MS', () => {
+      expect(CLOCK_SKEW_TOLERANCE_MS).toBe(2_000);
+      expect(CLOCK_SKEW_TOLERANCE_MS).toBeGreaterThan(0);
+      // Must stay well below the default TTL so it does not extend replay window.
+      expect(CLOCK_SKEW_TOLERANCE_MS).toBeLessThan(30_000);
+    });
+
+    it('accepts a pin issued slightly ahead of verifier clock (within tolerance)', () => {
+      // Simulates issuer clock ahead of verifier by (tolerance - 1 ms).
+      const aheadMs = (Date.now() + CLOCK_SKEW_TOLERANCE_MS - 1).toString();
+      const sig = makeHmac(VALID_SECRET, 'v1', aheadMs);
+      const pin = buildPin('v1', aheadMs, sig);
+      expect(verifyWriteFencePin(pin)).toBe(true);
+    });
+
+    it('accepts a pin at the exact CLOCK_SKEW_TOLERANCE_MS boundary', () => {
+      const aheadMs = (Date.now() + CLOCK_SKEW_TOLERANCE_MS).toString();
+      const sig = makeHmac(VALID_SECRET, 'v1', aheadMs);
+      const pin = buildPin('v1', aheadMs, sig);
+      // ageMs === -CLOCK_SKEW_TOLERANCE_MS → still accepted (>= -tolerance).
+      expect(verifyWriteFencePin(pin)).toBe(true);
+    });
+
+    it('rejects a pin issued ahead of verifier clock beyond tolerance', () => {
+      const aheadMs = (Date.now() + CLOCK_SKEW_TOLERANCE_MS + 1).toString();
+      const sig = makeHmac(VALID_SECRET, 'v1', aheadMs);
+      const pin = buildPin('v1', aheadMs, sig);
+      expect(verifyWriteFencePin(pin)).toBe(false);
+    });
+
+    it('accepts a pin issued slightly behind verifier clock (normal past age)', () => {
+      // Issuer clock behind verifier → positive ageMs; still within TTL.
+      const behindMs = (Date.now() - 500).toString();
+      const sig = makeHmac(VALID_SECRET, 'v1', behindMs);
+      const pin = buildPin('v1', behindMs, sig);
+      expect(verifyWriteFencePin(pin)).toBe(true);
+    });
+
+    it('keeps the TTL upper bound strict (no skew loosening on expiry)', () => {
+      process.env['RYW_PIN_TTL_SECONDS'] = '30';
+      // Past the TTL by 1 ms — must reject even though skew leeway exists on
+      // the future edge only.
+      const expiredMs = (Date.now() - 30_000 - 1).toString();
+      const sig = makeHmac(VALID_SECRET, 'v1', expiredMs);
+      const pin = buildPin('v1', expiredMs, sig);
       expect(verifyWriteFencePin(pin)).toBe(false);
     });
   });
