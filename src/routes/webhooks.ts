@@ -139,7 +139,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
  */
 webhooksRouter.get('/deliveries/:deliveryId', (req: Request, res: Response): void => {
   const deliveryId = req.params['deliveryId'];
-  const requestId = req.id;
+  const requestId = req.correlationId;
 
   if (!deliveryId) {
     res.status(400).json(
@@ -458,7 +458,7 @@ webhooksRouter.get('/metrics', (req, res) => {
  * Verify a webhook signature (for consumer testing)
  */
 webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, res) => {
-  const requestId = req.id;
+  const requestId = req.correlationId;
   const secret = req.query.secret as string;
   const deliveryId = req.header('x-fluxora-delivery-id');
   const timestamp = req.header('x-fluxora-timestamp');
@@ -555,7 +555,7 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
  * Process pending webhook retries (internal endpoint for background job)
  */
 webhooksRouter.post('/retry', express.json(), async (req, res) => {
-  const requestId = req.id;
+  const requestId = req.correlationId;
   const secret = req.query.secret as string;
 
   if (!secret) {

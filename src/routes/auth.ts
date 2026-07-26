@@ -75,7 +75,7 @@ authRouter.post(
   '/session',
   asyncHandler(async (req: Request, res: Response) => {
     const result = SessionRequestSchema.safeParse(req.body);
-    const requestId = req.id ?? req.correlationId;
+    const requestId = req.correlationId;
 
     if (!result.success) {
       throw validationError('Invalid session request', result.error.format());
@@ -184,7 +184,7 @@ authRouter.post(
   requirePermission(Permission.ADMIN_PAUSE), // Admin-only: any admin permission suffices
   asyncHandler(async (req: Request, res: Response) => {
     const result = RevokeRequestSchema.safeParse(req.body);
-    const requestId = req.id ?? req.correlationId;
+    const requestId = req.correlationId;
 
     if (!result.success) {
       throw validationError('Invalid revocation request', result.error.format());
