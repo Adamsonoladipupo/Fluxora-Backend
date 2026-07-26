@@ -14,6 +14,8 @@ declare global {
       correlationId?: string;
       /** Attached by apiVersion middleware based on the Accept-Version header. */
       apiVersion?: string;
+      /** Attached by enforceStreamScope middleware; the normalized caller address. */
+      callerAddress?: string;
     }
   }
 }

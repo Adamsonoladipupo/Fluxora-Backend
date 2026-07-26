@@ -52,6 +52,7 @@ import {
   setStreamListingDependencyState,
   setIdempotencyDependencyState,
   fingerprintInput,
+  enforceStreamScope,
 } from '../../src/routes/streams.js';
 import { initializeConfig } from '../../src/config/env.js';
 import { generateToken } from '../../src/lib/auth.js';
@@ -883,5 +884,48 @@ describe('streams routes', () => {
       const res = await post(validBody, uniqueKey('envelope-fresh')).expect(201);
       expect(res.body.meta.idempotencyReplayed).toBeUndefined();
     });
+  });
+});
+
+// ── enforceStreamScope middleware ─────────────────────────────────────────────
+
+describe('enforceStreamScope', () => {
+  function mockReqRes(overrides: Record<string, unknown> = {}) {
+    const req: Record<string, unknown> = { ...overrides };
+    const res = {
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    };
+    const next = vi.fn();
+    return { req, res, next } as unknown as Parameters<typeof enforceStreamScope>;
+  }
+
+  it('calls next() when req.user is not set (unauthenticated)', () => {
+    const { req, res, next } = mockReqRes();
+    enforceStreamScope(req as any, res as any, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect((req as any).callerAddress).toBeUndefined();
+  });
+
+  it('calls next() when user role is operator (bypass)', () => {
+    const { req, res, next } = mockReqRes({ user: { address: 'GABCDEF123', role: 'operator' } });
+    enforceStreamScope(req as any, res as any, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect((req as any).callerAddress).toBeUndefined();
+  });
+
+  it('sets callerAddress and calls next() for authenticated user with address', () => {
+    const { req, res, next } = mockReqRes({ user: { address: 'GXYZ789', role: 'viewer' } });
+    enforceStreamScope(req as any, res as any, next);
+    expect((req as any).callerAddress).toBe('GXYZ789');
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 500 when authenticated user has no address', () => {
+    const { req, res, next } = mockReqRes({ user: { address: undefined, role: 'viewer' } });
+    enforceStreamScope(req as any, res as any, next);
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    expect(next).not.toHaveBeenCalled();
   });
 });
