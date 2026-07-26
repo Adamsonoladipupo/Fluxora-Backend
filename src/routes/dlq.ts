@@ -126,12 +126,7 @@ dlqRouter.get(
   '/:id',
   requirePermission(Permission.DLQ_READ),
   asyncHandler(async (req: Request, res: Response) => {
-    const [entry, suspension] = await Promise.all([
-      dlqRepository.findById(req.params.id),
-      // We don't know the topic yet; fetch after entry resolves — two round-trips
-      // is acceptable here; the read path is not hot.
-      Promise.resolve(null) as Promise<null>,
-    ]);
+    const entry = await dlqRepository.findById(req.params.id);
 
     if (!entry) {
       res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
