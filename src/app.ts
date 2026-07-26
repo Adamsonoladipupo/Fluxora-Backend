@@ -327,7 +327,7 @@ export function createApp(options: AppOptions = {}): Express {
   });
 
   app.use((req: Request, res: Response) => {
-    const requestId = req.correlationId ?? req.id;
+    const requestId = req.correlationId;
     res.status(404).json(
       errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId),
     );

@@ -40,7 +40,7 @@ adminRouter.use(requireAdminAuth);
  *          optional `link`, and computed `daysUntilSunset` (negative if past sunset).
  */
 adminRouter.get('/deprecations', (req, res) => {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   const now = Date.now();
   const MS_PER_DAY = 86_400_000;
 
@@ -88,7 +88,7 @@ adminRouter.get('/pause', (_req, res) => {
  *   { "streamCreation": true, "ingestion": false }
  */
 adminRouter.put('/pause', async (req, res) => {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   const { streamCreation, ingestion } = req.body ?? {};
 
   if (streamCreation === undefined && ingestion === undefined) {
@@ -229,7 +229,7 @@ adminRouter.post('/indexer/stall/clear', (req, res) => {
  * Forcibly closes every active WebSocket subscription for a given stream_id.
  */
 adminRouter.post('/ws/disconnect', async (req, res) => {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   const { stream_id: streamIdValue } = req.body ?? {};
 
   if (typeof streamIdValue !== 'string') {
@@ -323,7 +323,7 @@ adminRouter.get('/api-keys', async (_req, res) => {
  * Body: { "name": "my-service" }
  */
 adminRouter.post('/api-keys', async (req, res) => {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   const { name } = req.body ?? {};
   if (!name || typeof name !== 'string') {
     res.status(400).json(
@@ -357,7 +357,7 @@ adminRouter.post('/api-keys', async (req, res) => {
  * invalidated. The new raw key is returned exactly once.
  */
 adminRouter.post('/api-keys/:id/rotate', async (req, res) => {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   try {
     const rotated = await rotateApiKey(req.params.id, req.correlationId);
     res.json(successResponse(rotated, requestId));
@@ -374,7 +374,7 @@ adminRouter.post('/api-keys/:id/rotate', async (req, res) => {
  * Revokes an API key. Revoked keys cannot authenticate requests.
  */
 adminRouter.delete('/api-keys/:id', async (req, res) => {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   try {
     await revokeApiKey(req.params.id, req.correlationId);
     res.status(204).send();

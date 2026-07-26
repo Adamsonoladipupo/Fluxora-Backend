@@ -15,7 +15,7 @@ import { getApiKeyFromRequest, getApiKeyRecord } from '../lib/apiKey.js';
  * If an invalid API key is present, returns 401.
  */
 export async function authenticateApiKey(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   const rawKey = getApiKeyFromRequest(req.headers);
 
   if (!rawKey) {
@@ -120,7 +120,7 @@ const tokenSchema = z.object({
  */
 export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
 
   debug('Authentication middleware triggered', { hasAuthHeader: !!authHeader, requestId });
 
@@ -191,7 +191,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
  * Must be used after `authenticate` middleware.
  */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   if (!req.user) {
     warn('Anonymous access denied to protected route', { path: req.path, requestId });
     res.status(401).json({
@@ -212,7 +212,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
  */
 export function requirePermission(permission: Permission) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const requestId = req.id ?? req.correlationId;
+    const requestId = req.correlationId;
 
     if (!req.user) {
       warn('Permission check failed: no authenticated user', { path: req.path, requestId });
@@ -253,7 +253,7 @@ export function requirePermission(permission: Permission) {
  */
 export function requireScope(...requiredScopes: string[]) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const requestId = req.id ?? req.correlationId;
+    const requestId = req.correlationId;
 
     const isApiKeyAuth = (req as any).keyId !== undefined;
     const isJwtAuth = req.user !== undefined;
