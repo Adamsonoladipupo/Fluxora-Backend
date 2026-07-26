@@ -142,6 +142,8 @@ importers:
         specifier: ^1.6.0
         version: 1.6.1(@types/node@20.19.43)
 
+  sdk/typescript: {}
+
 packages:
 
   '@ampproject/remapping@2.3.0':
