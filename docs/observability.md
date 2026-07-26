@@ -363,3 +363,9 @@ Labels:
 - `from_state`: The previous state.
 - `to_state`: The new state.
 - `consumer_hash`: SHA256 hash of the consumer URL, truncated to 16 characters, to ensure bounded cardinality.
+
+### WebSocket Micro-Batching Metrics
+
+| Metric Name | Type | Description | Buckets / Labels |
+| :--- | :--- | :--- | :--- |
+| `fluxora_ws_broadcast_batch_flush_seconds` | Histogram | Latency in seconds from enqueuing the oldest event in a batch to flushing the batch frame over the WebSocket. | `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]` |
