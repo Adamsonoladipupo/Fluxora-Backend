@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import http from 'http';
 import { WebSocket } from 'ws';
-import { StreamHub } from '../../src/ws/hub.js';
+import { StreamHub, RATE_LIMIT_MAX } from '../../src/ws/hub.js';
 import { _resetLimiter } from '../../src/ws/connectionLimiter.js';
 import { connectClient, sendJson, wait } from './fixtures/slowClient.js';
 
@@ -74,6 +74,12 @@ function closeWs(ws: WebSocket): Promise<void> {
     ws.close();
     setTimeout(() => resolve(), 100); // fallback
   });
+}
+
+function sendControlMessages(ws: WebSocket, messages: Array<Record<string, unknown>>): void {
+  for (const message of messages) {
+    ws.send(JSON.stringify(message));
+  }
 }
 
 describe('WebSocket upgrade TOCTOU concurrency', () => {
@@ -338,7 +344,71 @@ describe('WebSocket upgrade TOCTOU concurrency', () => {
     // Ensure memory is released
     expect(hub.getStreamSubscriptionCount(streamId)).toBe(0);
   });
-});
+  it('converges subscription state under rapid subscribe/unsubscribe flapping', async () => {
+    const result = await attemptConnect(port);
+    expect(result.success).toBe(true);
+    const ws = result.ws!;
+
+    const streamA = 'flap-stream-a';
+    const streamB = 'flap-stream-b';
+
+    sendControlMessages(ws, [
+      { type: 'subscribe', filter: { streamId: streamA } },
+      { type: 'unsubscribe', filter: { streamId: streamA } },
+      { type: 'subscribe', filter: { streamId: streamB } },
+      { type: 'unsubscribe', filter: { streamId: streamA } },
+      { type: 'subscribe', filter: { streamId: streamB } },
+    ]);
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const streamSubs = hub._getStreamSubscriptions();
+    expect(streamSubs.has(streamA)).toBe(false);
+    expect(streamSubs.has(streamB)).toBe(true);
+    expect(streamSubs.get(streamB)?.size).toBe(1);
+    expect(hub.getStreamSubscriptionCount(streamA)).toBe(0);
+    expect(hub.getStreamSubscriptionCount(streamB)).toBe(1);
+    expect(streamSubs.size).toBe(1);
+
+    await closeWs(ws);
+  });
+
+  it('rate limits pathological flapping without leaving stale subscription entries', async () => {
+    const result = await attemptConnect(port);
+    expect(result.success).toBe(true);
+    const ws = result.ws!;
+
+    const streamId = 'flap-rate-limit-stream';
+    const receivedErrors: unknown[] = [];
+
+    ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'error' && msg.code === 'RATE_LIMIT_EXCEEDED') {
+          receivedErrors.push(msg);
+        }
+      } catch {
+        // ignore malformed responses in this helper
+      }
+    });
+
+    const messages = Array.from({ length: RATE_LIMIT_MAX + 5 }, (_, index) => {
+      return {
+        type: index % 2 === 0 ? 'subscribe' : 'unsubscribe',
+        filter: { streamId },
+      };
+    });
+
+    sendControlMessages(ws, messages);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(receivedErrors.length).toBeGreaterThanOrEqual(5);
+    expect(hub.getStreamSubscriptionCount(streamId)).toBe(0);
+    expect(hub._getStreamSubscriptions().has(streamId)).toBe(false);
+    expect(hub._getStreamSubscriptions().size).toBe(0);
+
+    await closeWs(ws);
+  });});
 
 /**
  * Concurrency test suite verifying StreamHub.broadcast() tolerates client
