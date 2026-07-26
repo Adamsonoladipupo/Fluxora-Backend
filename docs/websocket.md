@@ -187,6 +187,87 @@ request headers.
 
 ---
 
+## Graceful Shutdown
+
+When the server receives SIGTERM or SIGINT it performs an ordered shutdown that
+notifies every connected WebSocket client **before** closing the HTTP server,
+giving clients enough information to distinguish a planned deploy from an
+abnormal termination.
+
+### Client close frame
+
+```
+Code:   1001 (RFC 6455 "Going Away")
+Reason: {"reason":"server_shutdown"}   ← JSON-encoded, ≤ 125 bytes
+```
+
+The `reason` field is one of the documented `WS_CLOSE_REASONS` constants
+exported from `src/ws/hub.ts`:
+
+| Reason string      | Meaning                                                  |
+|--------------------|----------------------------------------------------------|
+| `server_shutdown`  | Planned deploy / SIGTERM — back off before reconnecting. |
+| `max_duration`     | Connection hit its max-duration limit — reconnect now.   |
+
+### Recommended client behaviour
+
+```js
+ws.onclose = (event) => {
+  try {
+    const { reason } = JSON.parse(event.reason);
+    if (reason === 'server_shutdown') {
+      // Planned shutdown — wait for the service to come back, then reconnect.
+      scheduleReconnectWithExponentialBackoff();
+    } else {
+      // Other close reason (e.g. max_duration) — reconnect immediately.
+      reconnect();
+    }
+  } catch {
+    // Malformed or empty reason — treat as abnormal, apply backoff.
+    scheduleReconnectWithExponentialBackoff();
+  }
+};
+```
+
+### Timeout budget
+
+Each client is given `closeFrameTimeoutMs` (default **5 000 ms**) to
+acknowledge the close frame.  Clients that do not reply within the deadline are
+force-terminated via `ws.terminate()` so the shutdown never blocks indefinitely
+on a single stalled connection.
+
+Configure a tighter deadline if your process shutdown budget is constrained:
+
+```ts
+const hub = new StreamHub(server, { closeFrameTimeoutMs: 1_000 });
+```
+
+### Shutdown hook wiring
+
+`StreamHub.gracefulClose()` is registered as a `DrainableService` via
+`addDrainableShutdownHook` in `src/websockets/streamChannel.ts`.  It runs in
+the correct order relative to HTTP and database draining:
+
+```
+SIGTERM received
+  → HTTP server stops accepting new TCP connections
+  → StreamHub.gracefulClose() — notifies WS clients, waits for ACK
+  → HTTP server drains in-flight requests
+  → DB pool closes
+  → process exits
+```
+
+### Security notes
+
+- The close-frame reason payload contains **only** the opaque enum string
+  `"server_shutdown"`.  No stream data, user identifiers, internal diagnostics,
+  connection IDs, or secrets are included.
+- The payload is bounded to ≤ 125 bytes (RFC 6455 §5.5 close-frame limit).
+- Per-client timeouts prevent a malicious or stalled client from holding the
+  shutdown sequence hostage.
+
+---
+
 ## Micro-Batching (opt-in)
 
 When a stream emits many events in a short window (e.g. rapid `stream.updated`

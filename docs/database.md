@@ -193,12 +193,24 @@ To avoid rows landing in the unindexed `DEFAULT` partition, partitions for the n
 
 Fluxora provides PostgreSQL logical replication as an enterprise streaming mechanism for external consumers to tail real-time chain events directly from the database. Logical replication provides a high-throughput, push-based alternative to polling `GET /internal/indexer/events` (`src/routes/indexer.ts`).
 
+Migration: `migrations/20260723180000_contract_events_logical_replication.ts`
+Tests: `tests/db/logicalReplication.test.ts`
+
 ### Publication Scope & Security
 
 The publication `fluxora_contract_events_pub` is narrowly scoped to ensure data isolation and security:
 
 - **Single Table Scope**: Scoped exclusively to the `contract_events` table. Tables containing Personally Identifiable Information (PII) or sensitive tokens (such as `streams`, `api_keys`, or `webhook_outbox`) are explicitly excluded from replication.
 - **Append-Only Operations**: Configured with `WITH (publish = 'insert')`. Since `contract_events` is an append-only event ledger, restricting publication strictly to `INSERT` operations eliminates unnecessary WAL replication overhead for table maintenance and prevents exposing operational updates or deletes.
+
+### Partition Awareness
+
+`contract_events` is a range-partitioned table (`PARTITION BY RANGE happened_at`). The publication uses `FOR TABLE contract_events` — **without `ONLY`** — so that INSERT changes from all child partitions (e.g., `contract_events_y2026m07`, `contract_events_default`) flow through the publication automatically as new monthly partitions are created.
+
+> [!NOTE]
+> Using `FOR TABLE ONLY contract_events` would silently publish nothing because all rows live in child partitions, not the parent table. Never add `ONLY` to this publication.
+
+By default (PostgreSQL 15+), `publish_via_partition_root = true` causes the WAL decoder to report all partition rows under the parent `contract_events` table identity. This simplifies consumer schema management — consumers see a single `contract_events` stream regardless of which monthly partition holds the row. For PostgreSQL 12–14, rows are reported under their respective child partition names.
 
 ### Prerequisites & Server Configuration
 
@@ -309,6 +321,24 @@ If a consumer is decommissioned or experiences an extended outage and lag exceed
   for: 10m
   severity: warning
 ```
+
+### Running the Live Integration Tests
+
+The test suite in `tests/db/logicalReplication.test.ts` contains both offline unit tests (always run) and live-DB integration tests (require a real Postgres instance with `wal_level=logical`).
+
+Live tests are guarded by `INTEGRATION_DB=true` so they are **never triggered accidentally** by the test setup placeholder `DATABASE_URL`:
+
+```bash
+# Run live DB tests against a real database
+INTEGRATION_DB=true \
+DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:5432/indexer_db \
+pnpm test tests/db/logicalReplication.test.ts
+```
+
+The live suite verifies:
+- `fluxora_contract_events_pub` exists in `pg_publication` with `pubinsert=true`, `pubupdate=false`, `pubdelete=false`, `pubtruncate=false`
+- The publication is attached **solely** to `contract_events` (verified via `pg_publication_tables`)
+- `down()` fully removes the publication; `up()` re-applies it cleanly (rollback/re-apply cycle)
 
 ---
 
