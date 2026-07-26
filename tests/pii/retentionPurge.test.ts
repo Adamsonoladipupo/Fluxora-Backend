@@ -72,7 +72,10 @@ import { recordAuditEventToDb } from '../../src/lib/auditLog.js';
 
 // ── Mock client / pool factory ───────────────────────────────────────────────
 
-interface MockQuery { sql: string; params: unknown[] }
+interface MockQuery {
+  sql: string;
+  params: unknown[];
+}
 
 interface MockClientConfig {
   /** Rows returned per SELECT call, in order. */
@@ -103,7 +106,9 @@ function makeMockClient(cfg: MockClientConfig = {}) {
       }
       return { rows: [], rowCount: 0 };
     }),
-    release: vi.fn(() => { client.released = true; }),
+    release: vi.fn(() => {
+      client.released = true;
+    }),
   };
   return client;
 }
@@ -134,10 +139,7 @@ function row(overrides: Partial<Record<string, unknown>> = {}): Record<string, u
 const FIXED_NOW = new Date('2026-07-24T00:00:00.000Z');
 
 /** Build base PurgeJobOptions with injected pool. */
-function opts(
-  clients: MockClient[],
-  extra: Partial<PurgeJobOptions> = {}
-): PurgeJobOptions {
+function opts(clients: MockClient[], extra: Partial<PurgeJobOptions> = {}): PurgeJobOptions {
   return {
     now: FIXED_NOW,
     batchSize: 10,
@@ -217,6 +219,13 @@ describe('PURGEABLE_RETENTION_SCHEDULE', () => {
     expect(rule).toBeDefined();
     expect(rule!.retentionDays).toBe(365);
     expect(rule!.purgeAction).toBe('delete');
+  });
+
+  it('includes a stream address PII rule (365 days, redact)', () => {
+    const rule = PURGEABLE_RETENTION_SCHEDULE.find((r) => r.table === 'streams');
+    expect(rule).toBeDefined();
+    expect(rule!.retentionDays).toBe(365);
+    expect(rule!.purgeAction).toBe('redact');
   });
 
   it('includes a webhook_outbox rule (90 days, delete)', () => {
@@ -379,10 +388,7 @@ describe('runRetentionPurge() — legal-hold skip', () => {
 
   it('counts skipped rows in result summary', async () => {
     const c0 = makeMockClient({
-      rows: [
-        [row({ id: 'h1', legal_hold: true }), row({ id: 'p1', legal_hold: false })],
-        [],
-      ],
+      rows: [[row({ id: 'h1', legal_hold: true }), row({ id: 'p1', legal_hold: false })], []],
     });
     const c1 = makeMockClient({ rows: [[]] });
     const result = await runRetentionPurge(opts([c0, c1]));
@@ -471,23 +477,18 @@ describe('runRetentionPurge() — dry-run mode', () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('runRetentionPurge() — redact purge action', () => {
-  it('issues UPDATE (not DELETE) for redact purgeAction', async () => {
-    // The current PURGEABLE_RETENTION_SCHEDULE only has 'delete' rules,
-    // so we test the code path by verifying purgeRow logic via query inspection.
-    // The redact path sets `meta = jsonb_build_object('purged', true)`.
-    // We verify the code handles it by testing with the audit_logs rule
-    // and checking what kind of query is issued.
-    const rule = PURGEABLE_RETENTION_SCHEDULE.find((r) => r.table === 'audit_logs');
-    expect(rule?.purgeAction).toBe('delete');
+  it('issues UPDATE for stream redact purgeAction', async () => {
+    const rule = PURGEABLE_RETENTION_SCHEDULE.find((r) => r.table === 'streams');
+    expect(rule?.purgeAction).toBe('redact');
 
-    // All current rules use 'delete', so we verify the delete path.
-    // The redact code path is tested structurally by code review.
-    const c0 = makeMockClient({ rows: [[row({ id: 'a1' })], []] });
+    const c0 = makeMockClient({ rows: [[row({ id: 's1', legal_hold: false })], []] });
     const c1 = makeMockClient({ rows: [[]] });
     await runRetentionPurge(opts([c0, c1]));
-    const dels = c0.queries.filter((q) => /^DELETE/i.test(q.sql));
-    expect(dels).toHaveLength(1);
-    expect(dels[0].sql).toContain('audit_logs');
+
+    const updates = c0.queries.filter((q) => /^\bUPDATE\b/i.test(q.sql));
+    expect(updates).toHaveLength(1);
+    expect(updates[0].sql).toContain('sender_address');
+    expect(updates[0].sql).toContain('recipient_address');
   });
 });
 
@@ -584,9 +585,7 @@ describe('runRetentionPurge() — multiple batches', () => {
 
 describe('runRetentionPurge() — multiple rules', () => {
   it('processes every rule in PURGEABLE_RETENTION_SCHEDULE order', async () => {
-    const clients = PURGEABLE_RETENTION_SCHEDULE.map(() =>
-      makeMockClient({ rows: [[]] })
-    );
+    const clients = PURGEABLE_RETENTION_SCHEDULE.map(() => makeMockClient({ rows: [[]] }));
     const result = await runRetentionPurge(opts(clients));
     for (let i = 0; i < PURGEABLE_RETENTION_SCHEDULE.length; i++) {
       expect(result.results[i].category).toBe(PURGEABLE_RETENTION_SCHEDULE[i].category);
@@ -645,10 +644,7 @@ describe('runRetentionPurge() — correlation ID', () => {
 describe('runRetentionPurge() — audit write failure resilience', () => {
   it('continues the batch when recordAuditEventToDb rejects for a skipped row', async () => {
     vi.mocked(recordAuditEventToDb).mockRejectedValueOnce(new Error('audit write failed'));
-    const batch = [
-      row({ id: 'h1', legal_hold: true }),
-      row({ id: 'p1', legal_hold: false }),
-    ];
+    const batch = [row({ id: 'h1', legal_hold: true }), row({ id: 'p1', legal_hold: false })];
     const c0 = makeMockClient({ rows: [batch, []] });
     const c1 = makeMockClient({ rows: [[]] });
     // Should NOT throw — the skipped-audit failure is swallowed
@@ -659,10 +655,7 @@ describe('runRetentionPurge() — audit write failure resilience', () => {
 
   it('continues when all skipped rows fail audit writes', async () => {
     vi.mocked(recordAuditEventToDb).mockRejectedValue(new Error('audit down'));
-    const batch = [
-      row({ id: 'h1', legal_hold: true }),
-      row({ id: 'h2', legal_hold: true }),
-    ];
+    const batch = [row({ id: 'h1', legal_hold: true }), row({ id: 'h2', legal_hold: true })];
     const c0 = makeMockClient({ rows: [batch, []] });
     const c1 = makeMockClient({ rows: [[]] });
     const result = await runRetentionPurge(opts([c0, c1]));
@@ -972,8 +965,7 @@ describe('runRetentionPurge() — dry-run write isolation (#832)', () => {
     );
 
     const purgeInitiated = c0.queries.filter(
-      (q) =>
-        /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
+      (q) => /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
     );
     expect(purgeInitiated).toHaveLength(0);
   });
@@ -991,8 +983,7 @@ describe('runRetentionPurge() — dry-run write isolation (#832)', () => {
     );
 
     const purgeInitiated = c0.queries.filter(
-      (q) =>
-        /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
+      (q) => /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
     );
     expect(purgeInitiated.length).toBeGreaterThanOrEqual(1);
     expect(purgeInitiated[0].params).toContain('real-purge-audit');
@@ -1030,8 +1021,7 @@ describe('runRetentionPurge() — dry-run write isolation (#832)', () => {
 
     // No PURGE_INITIATED in dry-run even when some rows would be purged.
     const purgeInitiated = c0.queries.filter(
-      (q) =>
-        /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
+      (q) => /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
     );
     expect(purgeInitiated).toHaveLength(0);
   });
@@ -1068,8 +1058,7 @@ describe('runRetentionPurge() — dry-run write isolation (#832)', () => {
     );
 
     const purgeInitiated = c0.queries.filter(
-      (q) =>
-        /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
+      (q) => /INSERT INTO audit_logs/i.test(q.sql) && q.params.includes('PURGE_INITIATED')
     );
     expect(purgeInitiated.length).toBeGreaterThanOrEqual(1);
   });
@@ -1081,9 +1070,7 @@ describe('runRetentionPurge() — dry-run write isolation (#832)', () => {
     const c0 = makeStatefulClient(store);
     const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
 
-    await runRetentionPurge(
-      opts([c0 as unknown as MockClient, ...rest], { dryRun: true })
-    );
+    await runRetentionPurge(opts([c0 as unknown as MockClient, ...rest], { dryRun: true }));
 
     expect(c0.queries.filter((q) => /^\s*UPDATE/i.test(q.sql))).toHaveLength(0);
     expect(store.has('r1')).toBe(true);
