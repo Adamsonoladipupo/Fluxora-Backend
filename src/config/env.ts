@@ -297,6 +297,8 @@ export const EnvSchema = z.object({
    GRPC_GATEWAY_ENABLED: booleanEnv().default(false),
    /** Port the gRPC indexer gateway binds to when enabled. */
    GRPC_GATEWAY_PORT: integerEnv('GRPC_GATEWAY_PORT', 1, 65535).default(50052),
+   /** When true, reject non-TLS indexer worker connections (fail-closed). Defaults to true in production, false otherwise. */
+   INDEXER_MTLS_REQUIRED: booleanEnv().optional(),
    INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
    INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
   DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
@@ -475,6 +477,8 @@ export interface Config {
   grpcGatewayEnabled: boolean;
   /** Port the gRPC indexer gateway binds to when enabled. */
   grpcGatewayPort: number;
+  /** When true, reject non-TLS indexer worker connections (fail-closed). */
+  indexerMtlsRequired: boolean;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -656,6 +660,7 @@ function toConfig(env: ParsedEnv): Config {
     grpcHealthPort: env.GRPC_HEALTH_PORT,
     grpcGatewayEnabled: env.GRPC_GATEWAY_ENABLED,
     grpcGatewayPort: env.GRPC_GATEWAY_PORT,
+    indexerMtlsRequired: env.INDEXER_MTLS_REQUIRED ?? isProduction,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,

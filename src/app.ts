@@ -42,6 +42,7 @@ import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
 import { serverTimingMiddleware } from './middleware/serverTiming.js';
+import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
 import { drainSseEventBus } from './streams/sseEmitter.js';
@@ -387,6 +388,11 @@ export function createApp(options: AppOptions = {}): Express {
   void wireWebhookCircuitBreakerStore(appConfig);
   void wireAdminStateLock(appConfig);
   void wireIndexerLeaderElection(appConfig);
+
+  // Configure mTLS enforcement for indexer worker connections.
+  // When INDEXER_MTLS_REQUIRED is true (default in production), non-TLS
+  // connections are rejected (fail-closed).
+  setMtlsRequired(appConfig.indexerMtlsRequired);
 
   // Optional grpc.health.v1.Health service for Kubernetes-native gRPC probes,
   // on a separate port from the HTTP server so it never competes with API
