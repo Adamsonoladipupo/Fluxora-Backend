@@ -109,8 +109,10 @@ export class PgWebhookDeliveryStore implements IWebhookDeliveryStore {
       `);
 
       for (const row of outboxResult.rows) {
-        // Directly add to mirror's internal state via addToOutbox
-        this.mirror.addToOutbox({
+        // Restore persisted row into mirror's internal state, preserving
+        // its original id and status (which may be non-pending).
+        this.mirror.hydrateOutboxItem({
+          id: row.id,
           deliveryId: row.delivery_id,
           eventId: row.event_id,
           eventType: row.event_type as OutboxItem['eventType'],
@@ -241,7 +243,7 @@ export class PgWebhookDeliveryStore implements IWebhookDeliveryStore {
     );
   }
 
-  addToOutbox(item: Omit<OutboxItem, 'id'>): string {
+  addToOutbox(item: Omit<OutboxItem, 'id' | 'status'>): string {
     const id = this.mirror.addToOutbox(item);
     this.persistAsync(
       this.pool.query(
@@ -265,7 +267,8 @@ export class PgWebhookDeliveryStore implements IWebhookDeliveryStore {
           item.scheduledFor,
           item.attempts,
           item.maxAttempts,
-          item.status ?? 'pending',        ]
+          'pending',
+        ]
       ),
       'outbox insert'
     );
