@@ -223,6 +223,12 @@ export const EnvSchema = z.object({
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
   ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
 
+  /** OIDC issuer base URL, e.g. https://accounts.example.com. JWKS is fetched
+   *  from `${OIDC_ISSUER_URL}/.well-known/jwks.json`. Unset disables OIDC login. */
+  OIDC_ISSUER_URL: optionalUrlString('OIDC_ISSUER_URL'),
+  /** Expected `aud` (client_id) claim on OIDC ID tokens. */
+  OIDC_AUDIENCE: optionalString('OIDC_AUDIENCE'),
+
   MAX_REQUEST_SIZE: z.preprocess(
     byteSizeToNumber,
     z.number().int('MAX_REQUEST_SIZE must resolve to whole bytes').positive('MAX_REQUEST_SIZE must be positive'),
@@ -455,6 +461,11 @@ export interface Config {
   apiKeyPepper?: string | undefined;
   indexerWorkerToken: string;
 
+  /** OIDC issuer base URL. Undefined means OIDC login is disabled. */
+  oidcIssuerUrl?: string | undefined;
+  /** Expected `aud` (client_id) claim for OIDC ID tokens. */
+  oidcAudience?: string | undefined;
+
   maxRequestSizeBytes: number;
   maxJsonDepth: number;
   requestTimeoutMs: number;
@@ -651,6 +662,9 @@ function toConfig(env: ParsedEnv): Config {
       .filter((key) => key.length > 0),
     apiKeyPepper: env.API_KEY_PEPPER,
     indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
+
+    oidcIssuerUrl: env.OIDC_ISSUER_URL,
+    oidcAudience: env.OIDC_AUDIENCE,
 
     maxRequestSizeBytes: env.MAX_REQUEST_SIZE,
     maxJsonDepth: env.MAX_JSON_DEPTH,
