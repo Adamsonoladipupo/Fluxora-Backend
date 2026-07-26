@@ -72,8 +72,7 @@ import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
 import { sendEarlyHints } from '../utils/earlyHints.js';
-import { canonicalizeBody } from '../middleware/idempotency.js';
-import { streamRepository } from '../db/repositories/streamRepository.js';
+import { streamRepository, StatusConflictError } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
 import {
   issueWriteFencePin,
@@ -1048,6 +1047,18 @@ streamsRouter.delete(
     try {
       await streamRepository.updateStream(id, { status: 'cancelled' }, requestId ?? '');
     } catch (err) {
+      if (err instanceof StatusConflictError) {
+        throw new ApiError(
+          ApiErrorCode.CONFLICT,
+          err.message,
+          409,
+          {
+            streamId: id,
+            currentStatus: record!.status,
+            requestedStatus: 'cancelled',
+          },
+        );
+      }
       wrapDbError(err);
     }
 
@@ -1105,6 +1116,18 @@ streamsRouter.patch(
       const dbStatus = newStatus as StreamStatus;
       updated = await streamRepository.updateStream(id, { status: dbStatus }, requestId ?? '');
     } catch (err) {
+      if (err instanceof StatusConflictError) {
+        throw new ApiError(
+          ApiErrorCode.CONFLICT,
+          err.message,
+          409,
+          {
+            streamId: id,
+            currentStatus: record!.status,
+            requestedStatus: newStatus,
+          },
+        );
+      }
       wrapDbError(err);
     }
 
