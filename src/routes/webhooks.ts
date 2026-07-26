@@ -10,7 +10,7 @@
 import express from 'express';
 import type { Request, Response } from 'express';
 import { webhookService } from '../webhooks/service.js';
-import { webhookDeliveryStore } from '../webhooks/store.js';
+import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import { verifyWebhookSignature } from '../webhooks/signature.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
