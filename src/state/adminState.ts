@@ -10,8 +10,8 @@
 
 import * as fs from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { RedisClient } from '../redis/client.js';
-import { RedisDistributedLock, NoOpLock, Lock, REINDEX_LOCK_NAMESPACE } from './adminStateLock.js';
+import { NoOpRedisClient, type RedisClient } from '../redis/client.js';
+import { RedisDistributedLock, NoOpLock, Lock, AdminStateLockError, REINDEX_LOCK_NAMESPACE } from './adminStateLock.js';
 import { logger } from '../lib/logger.js';
 import { adminReindexJobDurationSeconds } from '../metrics/businessMetrics.js';
 
@@ -59,7 +59,7 @@ const state: AdminState = {
 };
 
 let pauseFlagsLock: Lock | null = null;
-let reindexLock: RedisDistributedLock | null = null;
+let reindexLock: Lock | null = null;
 
 hydratePauseFlagsFromPersistence();
 
@@ -172,12 +172,15 @@ export function initializeAdminStateLock(redis: RedisClient): void {
 async function acquirePauseFlagsLock(): Promise<Lock> {
   if (!pauseFlagsLock) {
     pauseFlagsLock = new RedisDistributedLock(
-      // Create a minimal Redis-compatible interface that falls back to file locking
-      { setNx: async () => false, del: async () => {} } as RedisClient,
+      new NoOpRedisClient(),
       'pauseFlags',
     );
   }
-  return pauseFlagsLock.acquire();
+  const lock = pauseFlagsLock;
+  if (!lock) {
+    throw new AdminStateLockError('pauseFlagsLock is not initialized');
+  }
+  return lock.acquire();
 }
 
 export function getPauseFlags(): PauseFlags {
@@ -334,6 +337,7 @@ export function _resetForTest(options: { clearPersistence?: boolean; clearLock?:
   };
 
   if (options.clearLock !== false) {
+    pauseFlagsLock = null;
     reindexLock = null;
   }
 

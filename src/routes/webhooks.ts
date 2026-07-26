@@ -16,6 +16,7 @@ import { verifyWebhookSignature } from '../webhooks/signature.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { logger } from '../lib/logger.js';
 import { successResponse, errorResponse } from '../utils/response.js';
+import { OffsetPaginationSchema } from '../validation/paginationSchema.js';
 
 export const webhooksRouter = express.Router();
 
@@ -160,7 +161,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
  */
 webhooksRouter.get('/deliveries/:deliveryId', (req: Request, res: Response): void => {
   const deliveryId = req.params['deliveryId'];
-  const requestId = req.id;
+  const requestId = req.correlationId;
 
   if (!deliveryId) {
     res.status(400).json(
@@ -201,7 +202,21 @@ webhooksRouter.get('/deliveries/:deliveryId', (req: Request, res: Response): voi
  * List all webhook deliveries (for monitoring/debugging)
  */
 webhooksRouter.get('/deliveries', (req, res) => {
-  const { status, limit = 100, offset = 0 } = req.query;
+  const parsed = OffsetPaginationSchema.safeParse(req.query);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    res.status(400).json({
+      error: {
+        code: 'INVALID_PAGINATION',
+        message: first?.message ?? 'Invalid pagination parameters',
+      },
+    });
+    return;
+  }
+
+  const limit  = parsed.data.limit  ?? 100;
+  const offset = parsed.data.offset ?? 0;
+  const { status } = req.query;
   
   let deliveries = webhookDeliveryStore.getAll();
   
@@ -210,7 +225,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
   }
   
   const total = deliveries.length;
-  const paginated = deliveries.slice(Number(offset), Number(offset) + Number(limit));
+  const paginated = deliveries.slice(offset, offset + limit);
 
   res.json({
     total,
@@ -271,9 +286,21 @@ webhooksRouter.get('/outbox', (req, res) => {
  * List dead-letter queue items
  */
 webhooksRouter.get('/dlq', (req, res) => {
-  const { limit = 50 } = req.query;
+  const parsed = OffsetPaginationSchema.safeParse(req.query);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    res.status(400).json({
+      error: {
+        code: 'INVALID_PAGINATION',
+        message: first?.message ?? 'Invalid pagination parameters',
+      },
+    });
+    return;
+  }
+
+  const limit = parsed.data.limit ?? 50;
   
-  const items = webhookDeliveryStore.getDeadLetterQueueItems(Number(limit));
+  const items = webhookDeliveryStore.getDeadLetterQueueItems(limit);
 
   res.json({
     total: items.length,
@@ -468,7 +495,7 @@ webhooksRouter.get('/metrics', (req, res) => {
  * Verify a webhook signature (for consumer testing)
  */
 webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, res) => {
-  const requestId = req.id;
+  const requestId = req.correlationId;
   const secret = req.query.secret as string;
   const deliveryId = req.header('x-fluxora-delivery-id');
   const timestamp = req.header('x-fluxora-timestamp');

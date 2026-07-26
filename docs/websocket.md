@@ -59,6 +59,14 @@ Cancels an active subscription filter. Same format and normalization rules as `s
 }
 ```
 
+### 2.1. Rapid Subscribe/Unsubscribe Flapping
+
+Clients may send multiple `subscribe` and `unsubscribe` frames in quick succession for the same or different filters. The hub is designed to converge on the last successfully processed filter state for that socket and remove any stale internal subscription state.
+
+- The same stream ID may be repeatedly subscribed and unsubscribed within the same event loop tick.
+- The last processed control message determines the active subscription state.
+- The per-connection message rate limiter still applies, so pathological flapping can be throttled without corrupting subscriptions.
+
 ### 3. Replay Message
 
 Requests a replay of historical events from the stream event store.
@@ -293,3 +301,19 @@ rate(fluxora_ws_batch_events_coalesced_total[5m])
 - Each outbound frame is checked against `MAX_MESSAGE_BYTES` before delivery.
   Oversized frames are truncated to the largest event prefix that fits, rather
   than silently dropped.
+
+### Broadcast Resilience
+
+`StreamHub.broadcast()` fans out to all matching subscribers in a tight loop.
+The hub tolerates client disconnects (abrupt `terminate()` or clean `close()`)
+that occur **during** the fan-out iteration:
+
+- Disconnected clients are silently skipped via the `readyState` check before
+  each `ws.send()` call, and the loop continues to the next subscriber without
+  interruption.
+- The `broadcast()` promise always resolves cleanly — no exception escapes.
+- `BackpressureMetrics` counters (`sentMessages`, `droppedMessages`,
+  `terminatedConnections`) remain consistent: no double-count or under-count
+  for the disconnected client.
+- Pending batch-accumulator timers for the disconnected client are cancelled
+  by `onDisconnect`, preventing stale frame delivery.
