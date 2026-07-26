@@ -41,6 +41,7 @@ import { requireJsonContentType } from './middleware/contentType.js';
 import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
+import { canaryRoutingMiddleware } from './middleware/canaryRouting.js';
 import { serverTimingMiddleware } from './middleware/serverTiming.js';
 import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
@@ -419,6 +420,9 @@ export function createApp(options: AppOptions = {}): Express {
   // It must also run before early-reject middlewares (body size, content type) 
   // so that rejected requests still carry a correlation ID.
   app.use(correlationIdMiddleware);
+  // Canary routing runs immediately after correlation-ID assignment so that
+  // every canary-tagged request carries a correlation ID end-to-end in logs.
+  app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
