@@ -5,7 +5,7 @@ import { warn, info, debug } from '../utils/logger.js';
 import { z } from 'zod';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
 import { authJwtVerifyDurationSeconds } from '../metrics/businessMetrics.js';
-import { getApiKeyFromRequest, getApiKeyRecord } from '../lib/apiKey.js';
+import { getApiKeyFromRequest, findRecordByRawKey } from '../lib/apiKey.js';
 
 
 /**
@@ -24,7 +24,7 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
   }
 
   try {
-    const record = getApiKeyRecord(rawKey);
+    const record = await findRecordByRawKey(rawKey);
     
     if (!record) {
       warn('API y authentication failed — key not found', { requestId });
@@ -61,7 +61,7 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
     });
     return res.status(401).json({
       error: {
-        code: ApiError.UNAUTHORIZED,
+        code: ApiErrorCode.UNAUTHORIZED,
         message: 'Authentication failed',
         requestId,
       },
