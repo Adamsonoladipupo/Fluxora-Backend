@@ -3,7 +3,7 @@ import type { Request, Response } from 'express';
 import { registry } from '../metrics.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { syncWebhookMetrics } from '../metrics/businessMetrics.js';
-import { webhookDeliveryStore } from '../webhooks/store.js';
+import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
 
 export const metricsRouter = express.Router();
 

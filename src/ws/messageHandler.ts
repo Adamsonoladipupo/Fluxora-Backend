@@ -3,11 +3,19 @@ import type { StreamEventReplayFilter } from '../db/types.js';
 import { STELLAR_PUBLIC_KEY_REGEX } from '../validation/schemas.js';
 
 const MAX_FILTER_VALUE_LENGTH = 256;
+const MAX_INBOUND_MESSAGE_BYTES = 4_096;
 const STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE = 6 << 3;
 const STELLAR_STRKEY_LENGTH = 56;
 const STELLAR_STRKEY_DECODED_LENGTH = 35;
 const STELLAR_STRKEY_PAYLOAD_LENGTH = 33;
 const STELLAR_STRKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+/**
+ * Maximum allowed message size in bytes (issue #674).
+ * Must match `MAX_MESSAGE_BYTES` in `src/ws/hub.ts` (4096).
+ * Duplicated here to avoid a circular import between hub.ts and messageHandler.ts.
+ */
+export const MAX_MESSAGE_BYTES = 4_096;
 
 // SEP-23 StrKey validation for Stellar Ed25519 public keys: base32 shape,
 // version byte, and CRC16-XModem checksum.
@@ -203,7 +211,51 @@ function validationMessage(issues: z.ZodIssue[]): string {
   return issues[0]?.message ?? 'Invalid WebSocket message';
 }
 
+/**
+ * Parse an inbound WebSocket control message from a client.
+ *
+ * This parser accepts both modern and aliased filter fields, including
+ * nested `filter` objects, and normalizes them to a stable internal format.
+ * Invalid messages are rejected with structured error codes.
+ *
+ * @param raw Parsed JSON value from the client frame.
+ * @returns The normalized WebSocket client message or a validation error.
+ */
+export function validateWebSocketMessage(data: unknown): WsMessageParseResult {
+  if (typeof data !== 'string') {
+    return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a string' };
+  }
+
+  const byteLength = Buffer.byteLength(data, 'utf8');
+  if (byteLength > MAX_INBOUND_MESSAGE_BYTES) {
+    return {
+      ok: false,
+      code: 'INVALID_MESSAGE',
+      message: `Message exceeds ${MAX_INBOUND_MESSAGE_BYTES} bytes (got ${byteLength})`,
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return { ok: false, code: 'INVALID_MESSAGE', message: 'Invalid JSON' };
+  }
+
+  return parseWsClientMessage(parsed);
+}
+
 export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
+  // Reject oversized payloads before any parsing (issue #674)
+  const rawString = typeof raw === 'string' ? raw : JSON.stringify(raw);
+  if (rawString && rawString.length > MAX_MESSAGE_BYTES) {
+    return { 
+      ok: false, 
+      code: 'INVALID_MESSAGE', 
+      message: `Message size ${rawString.length} exceeds maximum ${MAX_MESSAGE_BYTES} bytes` 
+    };
+  }
+
   if (!isObject(raw)) {
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a JSON object' };
   }

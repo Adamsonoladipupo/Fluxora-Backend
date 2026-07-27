@@ -104,6 +104,15 @@ that supports percentage-based rollout with deterministic per-requester bucketin
 ]
 ```
 
+Object form is also accepted for operator-managed config files:
+
+```json
+{
+  "streams_enhanced_response": { "percentage": 20, "description": "Enable enhanced response fields" },
+  "new_feature": 0
+}
+```
+
 Fields:
 - `name` — unique string identifier for the flag.
 - `percentage` — integer 0–100. 0 = disabled for all, 100 = enabled for all.
@@ -111,9 +120,13 @@ Fields:
 
 ### Determinism guarantee
 
-The rollout decision is computed as `FNV-1a32(flagName + ':' + requesterId) % 100 < percentage`.
+The rollout decision is computed from `SHA-256(flagName + requesterId) % 100 < percentage`.
 The same requester always receives the same decision for a given flag and percentage,
 without any shared state or random number generation, across all replicas.
+
+For stream routes, the requester id is resolved from the authenticated API key id
+when present, then the `X-API-Key` header, then the client IP. API keys are only
+used as hash input and are not logged or returned in responses.
 
 ---
 
@@ -167,3 +180,19 @@ log entry is emitted but the new value is **not** applied:
 applying it. No concurrent request can observe a partially-applied config.
 The feature flag map is replaced in a single JavaScript assignment, which is
 atomic in Node.js's single-threaded event loop.
+
+### Security guarantees
+
+- Restart-only variable names are logged on change, but their **values are never
+  included** in log output, preventing accidental secret leakage via log-shipping.
+- `reloadHotConfig()` returns a frozen (`Object.isFrozen`) object so no caller
+  can mutate the shared config snapshot.
+- The SIGHUP handler catches and logs all errors; a malformed environment after
+  a SIGHUP never kills the process.
+
+### Test isolation helper
+
+`resetStartupEnvSnapshot()` (exported from `src/config/env.ts`) resets the
+module-level startup snapshot back to `null`. It is intended **only** for unit
+tests that need to exercise `captureStartupEnvSnapshot()` in isolation without
+full module reloading. Never call it in production code.

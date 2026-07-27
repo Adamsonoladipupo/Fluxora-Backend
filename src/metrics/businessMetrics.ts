@@ -88,6 +88,15 @@ export const webhookDeliveriesSuppressedTotal =
     registers: [registry],
   });
 
+export const webhookDeliveriesTotal =
+  (registry.getSingleMetric('fluxora_webhook_deliveries_total') as Counter<'outcome'>) ||
+  new Counter({
+    name: 'fluxora_webhook_deliveries_total',
+    help: 'Total number of webhook delivery attempts, labeled by outcome',
+    labelNames: ['outcome'] as const,
+    registers: [registry],
+  });
+
 export const webhookDeliveryDurationSeconds =
   (registry.getSingleMetric('fluxora_webhook_delivery_duration_seconds') as Histogram) ||
   new Histogram({
@@ -169,6 +178,23 @@ export const sseSubscriberErrorsTotal =
     name: 'fluxora_sse_subscriber_errors_total',
     help: 'Total number of errors thrown by live SSE subscriber callbacks',
     labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Counter for SSE connections dropped due to backpressure (buffer overflow).
+ *
+ * Fires when a slow consumer's per-connection buffer exceeds
+ * `SSE_MAX_BUFFERED_EVENTS` and the connection is severed to prevent
+ * unbounded memory growth (DoS vector).
+ *
+ * @security No payloads, IPs, or PII. Bounded cardinality (single series).
+ */
+export const sseBackpressureDropsTotal =
+  (registry.getSingleMetric('fluxora_sse_backpressure_drops_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_sse_backpressure_drops_total',
+    help: 'Total number of SSE connections dropped due to per-connection buffer overflow (slow consumer backpressure)',
     registers: [registry],
   });
 

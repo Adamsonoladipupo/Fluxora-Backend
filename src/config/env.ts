@@ -223,6 +223,12 @@ export const EnvSchema = z.object({
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
   ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
 
+  /** OIDC issuer base URL, e.g. https://accounts.example.com. JWKS is fetched
+   *  from `${OIDC_ISSUER_URL}/.well-known/jwks.json`. Unset disables OIDC login. */
+  OIDC_ISSUER_URL: optionalUrlString('OIDC_ISSUER_URL'),
+  /** Expected `aud` (client_id) claim on OIDC ID tokens. */
+  OIDC_AUDIENCE: optionalString('OIDC_AUDIENCE'),
+
   MAX_REQUEST_SIZE: z.preprocess(
     byteSizeToNumber,
     z.number().int('MAX_REQUEST_SIZE must resolve to whole bytes').positive('MAX_REQUEST_SIZE must be positive'),
@@ -274,6 +280,7 @@ export const EnvSchema = z.object({
   ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
   WS_AUTH_REQUIRED: booleanEnv().default(false),
   SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
+  SSE_MAX_CONNECTIONS_PER_API_KEY: integerEnv('SSE_MAX_CONNECTIONS_PER_API_KEY', 1, 100_000).default(50),
   SSE_MAX_GLOBAL_CONNECTIONS: integerEnv('SSE_MAX_GLOBAL_CONNECTIONS', 1, 100_000).default(1000),
   SSE_MAX_CONNECTION_DURATION_MS: integerEnv('SSE_MAX_CONNECTION_DURATION_MS', 1, 86_400_000).default(30 * 60 * 1000),
   SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
@@ -293,6 +300,12 @@ export const EnvSchema = z.object({
    GRPC_HEALTH_ENABLED: booleanEnv().default(false),
    /** Port the gRPC health service binds to when enabled. Separate from PORT (HTTP). */
    GRPC_HEALTH_PORT: integerEnv('GRPC_HEALTH_PORT', 1, 65535).default(50051),
+   /** Enables the optional gRPC transcoding gateway for indexer communication. Default off. */
+   GRPC_GATEWAY_ENABLED: booleanEnv().default(false),
+   /** Port the gRPC indexer gateway binds to when enabled. */
+   GRPC_GATEWAY_PORT: integerEnv('GRPC_GATEWAY_PORT', 1, 65535).default(50052),
+   /** When true, reject non-TLS indexer worker connections (fail-closed). Defaults to true in production, false otherwise. */
+   INDEXER_MTLS_REQUIRED: booleanEnv().optional(),
    INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
    INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
   DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
@@ -320,6 +333,36 @@ export const EnvSchema = z.object({
   S3_BACKUP_PREFIX: optionalString('S3_BACKUP_PREFIX'),
 
   FLUXORA_SHUTDOWN: booleanEnv().optional(),
+
+  /**
+   * Tiered startup dependency probing.
+   *
+   * STARTUP_PROBE_BUDGET_MS          — total wall-clock budget for soft-tier
+   *                                    retries (Redis, Stellar RPC) before the
+   *                                    service falls back to degraded mode.
+   *                                    Default: 30 000 ms.
+   * STARTUP_PROBE_POSTGRES_TIMEOUT_MS — per-attempt timeout for the single
+   *                                    Postgres (hard-tier) probe.
+   *                                    Default: 5 000 ms.
+   * STARTUP_PROBE_REDIS_TIMEOUT_MS   — per-attempt timeout for each Redis
+   *                                    (soft-tier) retry attempt.
+   *                                    Default: 3 000 ms.
+   * STARTUP_PROBE_STELLAR_TIMEOUT_MS — per-attempt timeout for each Stellar
+   *                                    RPC (soft-tier) retry attempt.
+   *                                    Default: 5 000 ms.
+   */
+  STARTUP_PROBE_BUDGET_MS: integerEnv('STARTUP_PROBE_BUDGET_MS', 1).default(30_000),
+  STARTUP_PROBE_POSTGRES_TIMEOUT_MS: integerEnv('STARTUP_PROBE_POSTGRES_TIMEOUT_MS', 1).default(5_000),
+  STARTUP_PROBE_REDIS_TIMEOUT_MS: integerEnv('STARTUP_PROBE_REDIS_TIMEOUT_MS', 1).default(3_000),
+  STARTUP_PROBE_STELLAR_TIMEOUT_MS: integerEnv('STARTUP_PROBE_STELLAR_TIMEOUT_MS', 1).default(5_000),
+
+  /**
+   * Percentage of traffic (0–100) to route through the canary code path.
+   * 0 disables canary tagging entirely (default). Set to e.g. 10 to tag
+   * 10 % of clients deterministically as canary based on a SHA-256 hash
+   * of their identity (API key or IP).
+   */
+  CANARY_TRAFFIC_PERCENT: integerEnv('CANARY_TRAFFIC_PERCENT', 0, 100).default(0),
 }).passthrough().superRefine((env, ctx) => {
   const stellarNetwork = resolvedStellarNetwork(env);
   const expectedPassphrase = STELLAR_NETWORK_PASSPHRASES[stellarNetwork];
@@ -342,6 +385,32 @@ export const EnvSchema = z.object({
       path: ['API_KEY_PEPPER'],
       message: 'API_KEY_PEPPER is required when API_KEYS is configured',
     });
+  }
+
+  if (env.NODE_ENV === 'production') {
+    if (env.LOG_LEVEL === 'debug') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['LOG_LEVEL'],
+        message: 'LOG_LEVEL must not be "debug" in production',
+      });
+    }
+
+    if (env.CORS_ALLOWED_ORIGINS !== undefined && env.CORS_ALLOWED_ORIGINS.includes('*')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['CORS_ALLOWED_ORIGINS'],
+        message: 'CORS_ALLOWED_ORIGINS must not contain a wildcard "*" origin in production',
+      });
+    }
+
+    if (env.PGCRYPTO_KEY === undefined || env.PGCRYPTO_KEY.length < 32) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PGCRYPTO_KEY'],
+        message: 'PGCRYPTO_KEY is required in production (minimum 32 characters)',
+      });
+    }
   }
 });
 
@@ -378,6 +447,7 @@ export interface Config {
   redisClusterNodes?: string | undefined;
 
   stellarNetwork: StellarNetwork;
+  stellarRpcUrl: string;
   horizonUrl: string;
   horizonNetworkPassphrase: string;
   contractAddresses: ContractAddresses;
@@ -390,6 +460,11 @@ export interface Config {
   /** Server-side pepper for API-key hashing. Never logged. */
   apiKeyPepper?: string | undefined;
   indexerWorkerToken: string;
+
+  /** OIDC issuer base URL. Undefined means OIDC login is disabled. */
+  oidcIssuerUrl?: string | undefined;
+  /** Expected `aud` (client_id) claim for OIDC ID tokens. */
+  oidcAudience?: string | undefined;
 
   maxRequestSizeBytes: number;
   maxJsonDepth: number;
@@ -425,6 +500,7 @@ export interface Config {
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
   sseMaxConnectionsPerIp: number;
+  sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
   sseMaxConnectionDurationMs: number;
   sseRetryAfterSeconds: number;
@@ -444,6 +520,12 @@ export interface Config {
   grpcHealthEnabled: boolean;
   /** Port the gRPC health service binds to when enabled. */
   grpcHealthPort: number;
+  /** Enables the optional gRPC transcoding gateway for indexer communication. */
+  grpcGatewayEnabled: boolean;
+  /** Port the gRPC indexer gateway binds to when enabled. */
+  grpcGatewayPort: number;
+  /** When true, reject non-TLS indexer worker connections (fail-closed). */
+  indexerMtlsRequired: boolean;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -451,6 +533,27 @@ export interface Config {
   // S3 Backup Retention
   s3BackupBucket?: string | undefined;
   s3BackupPrefix?: string | undefined;
+
+  /**
+   * Tiered startup dependency probing.
+   *
+   * See `probeStartupDependencies()` in `src/config/health.ts` for details on
+   * the two-tier (hard / soft) probe strategy.
+   */
+  /** Total wall-clock budget for soft-tier retries (Redis, Stellar RPC), ms. */
+  startupProbeBudgetMs: number;
+  /** Per-attempt timeout for the single Postgres (hard-tier) probe, ms. */
+  startupProbePostgresTimeoutMs: number;
+  /** Per-attempt timeout for each Redis (soft-tier) retry attempt, ms. */
+  startupProbeRedisTimeoutMs: number;
+  /** Per-attempt timeout for each Stellar RPC (soft-tier) retry attempt, ms. */
+  startupProbeStellarTimeoutMs: number;
+
+  /**
+   * Percentage of traffic (0–100) to tag as canary.
+   * 0 means no canary tagging. Sourced from CANARY_TRAFFIC_PERCENT.
+   */
+  canaryTrafficPercent: number;
 }
 
 export class ConfigError extends Error {
@@ -544,6 +647,7 @@ function toConfig(env: ParsedEnv): Config {
     redisClusterNodes: env.REDIS_CLUSTER_NODES,
 
     stellarNetwork,
+    stellarRpcUrl: env.STELLAR_RPC_URL,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
     horizonNetworkPassphrase: env.HORIZON_NETWORK_PASSPHRASE ?? networkDefaults.passphrase,
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
@@ -558,6 +662,9 @@ function toConfig(env: ParsedEnv): Config {
       .filter((key) => key.length > 0),
     apiKeyPepper: env.API_KEY_PEPPER,
     indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
+
+    oidcIssuerUrl: env.OIDC_ISSUER_URL,
+    oidcAudience: env.OIDC_AUDIENCE,
 
     maxRequestSizeBytes: env.MAX_REQUEST_SIZE,
     maxJsonDepth: env.MAX_JSON_DEPTH,
@@ -595,6 +702,7 @@ function toConfig(env: ParsedEnv): Config {
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
+    sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
     sseMaxConnectionDurationMs: env.SSE_MAX_CONNECTION_DURATION_MS,
     sseRetryAfterSeconds: env.SSE_RETRY_AFTER_SECONDS,
@@ -607,12 +715,22 @@ function toConfig(env: ParsedEnv): Config {
     healthCheckIntervalMs: env.HEALTH_CHECK_INTERVAL_MS,
     grpcHealthEnabled: env.GRPC_HEALTH_ENABLED,
     grpcHealthPort: env.GRPC_HEALTH_PORT,
+    grpcGatewayEnabled: env.GRPC_GATEWAY_ENABLED,
+    grpcGatewayPort: env.GRPC_GATEWAY_PORT,
+    indexerMtlsRequired: env.INDEXER_MTLS_REQUIRED ?? isProduction,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
 
     s3BackupBucket: env.S3_BACKUP_BUCKET,
     s3BackupPrefix: env.S3_BACKUP_PREFIX,
+
+    startupProbeBudgetMs: env.STARTUP_PROBE_BUDGET_MS,
+    startupProbePostgresTimeoutMs: env.STARTUP_PROBE_POSTGRES_TIMEOUT_MS,
+    startupProbeRedisTimeoutMs: env.STARTUP_PROBE_REDIS_TIMEOUT_MS,
+    startupProbeStellarTimeoutMs: env.STARTUP_PROBE_STELLAR_TIMEOUT_MS,
+
+    canaryTrafficPercent: env.CANARY_TRAFFIC_PERCENT,
   };
 }
 
@@ -646,6 +764,19 @@ export function initializeConfig(): Config {
 
 export function resetConfig(): void {
   configInstance = null;
+}
+
+/**
+ * Reset the startup env snapshot back to null.
+ *
+ * **FOR TESTING ONLY.** Allows each test to exercise
+ * `captureStartupEnvSnapshot()` / `reloadHotConfig()` in isolation without
+ * full module reloading. Never call this in production code.
+ *
+ * @internal
+ */
+export function resetStartupEnvSnapshot(): void {
+  startupEnvSnapshot = null;
 }
 
 // ─── Hot-reload support ───────────────────────────────────────────────────────

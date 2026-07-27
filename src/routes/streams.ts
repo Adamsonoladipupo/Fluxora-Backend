@@ -67,13 +67,19 @@ import {
   tooManyRequests,
 } from '../middleware/errorHandler.js';
 import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
+import { canonicalizeBody } from '../middleware/idempotency.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
 import { sendEarlyHints } from '../utils/earlyHints.js';
-import { streamRepository } from '../db/repositories/streamRepository.js';
+import { streamRepository, StatusConflictError } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
+import {
+  issueWriteFencePin,
+  shouldForcePrimaryFromHeaders,
+  WRITE_FENCE_HEADER,
+} from '../db/writeFencePin.js';
 import {
   CreateStreamSchema,
   parseBody,
@@ -175,6 +181,7 @@ type NormalizedCreateInput = {
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
 const NO_STORE_STREAM_HEADERS = 'private, no-store';
+const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
@@ -247,6 +254,28 @@ function toApiStream(record: StreamRecord): Stream {
     endTime:       record.end_time,
     status:        record.status,
   };
+}
+
+/**
+ * Resolve a stable rollout identity for feature flag bucketing.
+ *
+ * @security API-key authenticated requests prefer the server-side key id. When
+ * that is not available, raw X-API-Key header material is used only as input to
+ * the feature flag hash and is never logged or included in responses.
+ */
+export function getFeatureFlagRequesterId(req: Request): string {
+  const keyId = (req as Request & { keyId?: unknown }).keyId;
+  if (typeof keyId === 'string' && keyId.trim() !== '') {
+    return `key:${keyId}`;
+  }
+
+  const rawApiKey = req.headers['x-api-key'];
+  const apiKey = Array.isArray(rawApiKey) ? rawApiKey[0] : rawApiKey;
+  if (typeof apiKey === 'string' && apiKey.trim() !== '') {
+    return `api-key:${apiKey.trim()}`;
+  }
+
+  return `ip:${req.ip ?? 'anonymous'}`;
 }
 
 type StreamResourceMetadata = {
@@ -359,9 +388,9 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   if (!parseResult.success) {
     const formatted = formatZodIssues(parseResult.issues);
     throw new ApiError(
+      400,
       ApiErrorCode.VALIDATION_ERROR,
       formatted[0]?.message ?? 'Validation failed',
-      400,
       formatted.map((e) => e.message).join('; '),
     );
   }
@@ -374,9 +403,9 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   );
   if (!amountValidation.valid) {
     throw new ApiError(
+      400,
       ApiErrorCode.VALIDATION_ERROR,
       'Invalid decimal string format for amount fields',
-      400,
       { errors: amountValidation.errors.map((e) => ({ field: e.field, code: e.code, message: e.message })) },
     );
   }
@@ -403,8 +432,8 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   };
 }
 
-function fingerprintInput(input: NormalizedCreateInput): string {
-  return crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
+export function fingerprintInput(input: NormalizedCreateInput): string {
+  return crypto.createHash('sha256').update(canonicalizeBody(input)).digest('hex');
 }
 
 /** Wrap DB errors so pool exhaustion surfaces as 503. */
@@ -481,7 +510,7 @@ streamsRouter.get(
   authenticateApiKey,
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id as string | undefined;
+    const requestId = req.correlationId as string | undefined;
 
     // Validate all query params in one pass via Zod
     const parsed = PaginationSchema.safeParse(req.query);
@@ -500,6 +529,13 @@ streamsRouter.get(
       throw serviceUnavailable('Stream list is temporarily unavailable. Retry when dependency health is restored.');
     }
 
+    // Read-your-writes: if the client echoes a valid, unexpired write-fence
+    // pin, route this read to the primary pool so the client sees its own
+    // recent write even if the replica is lagging.
+    const forcePrimary = shouldForcePrimaryFromHeaders(
+      req.headers as Record<string, string | string[] | undefined>,
+    );
+
     let result: { streams: Stream[]; hasMore: boolean; total?: number };
     const dbStart = process.hrtime.bigint();
     try {
@@ -512,6 +548,7 @@ streamsRouter.get(
         limit,
         cursor?.lastId,
         includeTotal,
+        { forcePrimary },
       );
       result = {
         streams: dbResult.streams.map(toApiStream),
@@ -563,13 +600,8 @@ streamsRouter.get(
     if (includeTotal && result!.total !== undefined) response.total = result!.total;
 
     // Feature flag: streams_enhanced_response — add _meta field for opted-in requesters.
-    // The requester is identified by API key or IP; falls back to 'anonymous'.
-    // This is a zero-risk opt-in: if the flag is not configured, enhanced stays false.
-    const requesterId: string =
-      (req as unknown as Record<string, unknown>)['apiKey'] as string
-        ?? req.ip
-        ?? 'anonymous';
-    if (isFlagEnabled('streams_enhanced_response', requesterId)) {
+    const requesterId = getFeatureFlagRequesterId(req);
+    if (isFlagEnabled(STREAMS_ENHANCED_RESPONSE_FLAG, requesterId)) {
       response._meta = { enhanced: true };
     }
 
@@ -769,7 +801,7 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     if (!id) {
       throw notFound('Stream', '');
     }
@@ -813,7 +845,22 @@ streamsRouter.get(
 
 /**
  * GET /api/streams/:id/export.jsonld
- * Export a single stream as JSON-LD for data portability.
+ *
+ * Export a single stream as a JSON-LD document for data portability.
+ *
+ * The response body is a raw JSON-LD object (not wrapped in the standard
+ * `successResponse` envelope) so that linked-data processors can consume it
+ * directly without unwrapping.
+ *
+ * Headers
+ * ───────
+ * - Content-Type: application/ld+json
+ * - ETag / Last-Modified: identical to GET /:id for cache validators
+ * - Cache-Control: public,max-age=300 for terminal streams; private,no-store otherwise
+ * - Link: <https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"
+ *
+ * Authentication: API key + streams:read scope (same as GET /:id).
+ * Rate limiting: inherits the global rate-limiter applied to all /api/* routes.
  */
 streamsRouter.get(
   '/:id/export.jsonld',
@@ -821,13 +868,15 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
+
     if (!id) {
       throw notFound('Stream', '');
     }
-    debug('Exporting stream as JSON-LD', { id });
 
-    let record;
+    debug('Exporting stream as JSON-LD', { id, requestId });
+
+    let record: StreamRecord | undefined | null;
     try {
       record = await streamRepository.getById(id);
     } catch (err) {
@@ -836,16 +885,39 @@ streamsRouter.get(
 
     if (!record) throw notFound('Stream', id);
 
-    const jsonld = toStreamJsonLd(record!);
-    setStreamResourceHeaders(res, record!);
+    // Conditional GET — reuse the same ETag fingerprint as GET /:id so that
+    // clients which already validated the plain-JSON representation can skip
+    // re-fetching the JSON-LD document unconditionally.
+    const etag = streamEntityTag(record);
+    const rawIfNoneMatch = req.headers['if-none-match'];
+    if (rawIfNoneMatch !== undefined) {
+      const header = Array.isArray(rawIfNoneMatch)
+        ? rawIfNoneMatch.join(', ')
+        : rawIfNoneMatch;
+      if (matchesIfNoneMatch(header, etag)) {
+        res.set('ETag', etag);
+        res.set('Last-Modified', new Date(record.updated_at).toUTCString());
+        res.status(304).end();
+        return;
+      }
+    }
+
+    const jsonLdDoc = toStreamJsonLd(record);
+
+    setStreamResourceHeaders(res, record);
     res.set(
       'Cache-Control',
-      isTerminalStatus(record!.status as ApiStreamStatus)
+      isTerminalStatus(record.status as ApiStreamStatus)
         ? CACHEABLE_STREAM_HEADERS
         : NO_STORE_STREAM_HEADERS,
     );
+    // Advertise the context document per the JSON-LD HTTP spec (§4.1).
+    res.set(
+      'Link',
+      '<https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
+    );
     res.type('application/ld+json');
-    res.send(JSON.stringify(jsonld));
+    res.send(JSON.stringify(jsonLdDoc));
   }),
 );
 
@@ -864,7 +936,7 @@ streamsRouter.post(
   requireScope('streams:write'),
   requireIdempotencyKey,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id;
+    const requestId = req.correlationId;
     const correlationId = req.correlationId;
     const idempotencyKey = parseIdempotencyKeyHeader(req.header('Idempotency-Key'));
 
@@ -909,9 +981,9 @@ streamsRouter.post(
           action: 'conflict',
         });
         throw new ApiError(
+          409,
           ApiErrorCode.CONFLICT,
           'Idempotency-Key has already been used for a different request payload',
-          409,
           { hint: 'Use a new Idempotency-Key or retry with the original request body' },
         );
       }
@@ -975,6 +1047,21 @@ streamsRouter.post(
 
     streamsCreatedTotal.inc({ status: stream.status });
 
+    // Issue a read-your-writes fence pin.  The client must echo this token in
+    // the X-Fluxora-Write-Fence request header on its next GET /api/streams
+    // call to ensure the read is routed to the primary pool while the replica
+    // may still be lagging.  The pin expires after RYW_PIN_TTL_SECONDS (default
+    // 30 s) and is ignored if missing, malformed, or expired.
+    try {
+      res.set(WRITE_FENCE_HEADER, issueWriteFencePin());
+    } catch (pinErr) {
+      // Never let a pin-issuance failure break stream creation — log and skip.
+      warn('Failed to issue write-fence pin', {
+        error: pinErr instanceof Error ? pinErr.message : String(pinErr),
+        requestId,
+      });
+    }
+
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');
     res.status(201).json(responseEnvelope);
@@ -993,7 +1080,7 @@ streamsRouter.delete(
   requireScope('streams:write'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     if (!id) {
       throw notFound('Stream', '');
     }
@@ -1010,7 +1097,7 @@ streamsRouter.delete(
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, 'cancelled');
     if (!guard.ok) {
-      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+      throw new ApiError(409, ApiErrorCode.CONFLICT, guard.message, {
         streamId: id,
         currentStatus: record!.status,
       });
@@ -1019,6 +1106,18 @@ streamsRouter.delete(
     try {
       await streamRepository.updateStream(id, { status: 'cancelled' }, requestId ?? '');
     } catch (err) {
+      if (err instanceof StatusConflictError) {
+        throw new ApiError(
+          409,
+          ApiErrorCode.CONFLICT,
+          err.message,
+          {
+            streamId: id,
+            currentStatus: record!.status,
+            requestedStatus: 'cancelled',
+          },
+        );
+      }
       wrapDbError(err);
     }
 
@@ -1041,7 +1140,7 @@ streamsRouter.patch(
   '/:id/status',
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     const { status: newStatus } = req.body ?? {};
 
     if (!id) {
@@ -1064,7 +1163,7 @@ streamsRouter.patch(
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, newStatus as ApiStreamStatus);
     if (!guard.ok) {
-      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+      throw new ApiError(409, ApiErrorCode.CONFLICT, guard.message, {
         streamId: id,
         currentStatus: record!.status,
         requestedStatus: newStatus,
@@ -1076,6 +1175,18 @@ streamsRouter.patch(
       const dbStatus = newStatus as StreamStatus;
       updated = await streamRepository.updateStream(id, { status: dbStatus }, requestId ?? '');
     } catch (err) {
+      if (err instanceof StatusConflictError) {
+        throw new ApiError(
+          409,
+          ApiErrorCode.CONFLICT,
+          err.message,
+          {
+            streamId: id,
+            currentStatus: record!.status,
+            requestedStatus: newStatus,
+          },
+        );
+      }
       wrapDbError(err);
     }
 
@@ -1098,7 +1209,7 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
 
     if (!id) {
       throw notFound('Stream', '');
@@ -1134,7 +1245,8 @@ streamsRouter.get(
     // 2. Reserve bounded SSE capacity before repository work or header flush.
     const clientIp = getClientIp(req);
     const sseLimits = resolveSseConnectionLimits();
-    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
+    const apiKey = (req.headers['x-api-key'] as string | undefined) ?? undefined;
+    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits, apiKey);
 
     if (!connectionAttempt.ok) {
       res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
@@ -1485,7 +1597,8 @@ streamsRouter.get(
     // 2. Reserve connection capacity from sseConnectionLimiter
     const clientIp = getClientIp(req);
     const sseLimits = resolveSseConnectionLimits();
-    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
+    const apiKey = (req.headers['x-api-key'] as string | undefined) ?? undefined;
+    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits, apiKey);
 
     if (!connectionAttempt.ok) {
       res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));

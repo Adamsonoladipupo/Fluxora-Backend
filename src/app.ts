@@ -8,7 +8,7 @@ import { auditRouter } from './routes/audit.js';
 import { adminRouter } from './routes/admin.js';
 import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
-import { webhooksRouter } from './routes/webhooks.js';
+import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
 import { privacyHeaders } from './middleware/pii.js';
 import type { Config } from './config/env.js';
@@ -41,7 +41,9 @@ import { requireJsonContentType } from './middleware/contentType.js';
 import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
+import { canaryRoutingMiddleware } from './middleware/canaryRouting.js';
 import { serverTimingMiddleware } from './middleware/serverTiming.js';
+import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
 import { drainSseEventBus } from './streams/sseEmitter.js';
@@ -58,6 +60,7 @@ import { successResponse, errorResponse } from './utils/response.js';
 import { docsRouter } from './routes/docs.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
 import { startBackgroundJobs } from './jobs/queue.js';
+import { csrfMiddleware } from './middleware/csrf.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -181,6 +184,46 @@ async function wireStreamEventDedupCache(config: Config): Promise<void> {
       },
     );
     setDedupCache(new InMemoryDedupCache());
+  }
+}
+
+async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info('Redis disabled — inbound webhook dedup will use in-memory cache');
+    setInboundWebhookDedupCache(new InMemoryDedupCache());
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    const primary = new RedisDedupCache(redisClient);
+    const fallback = new InMemoryDedupCache();
+    const hybrid = new HybridDedupCache(primary, fallback, true);
+
+    setInboundWebhookDedupCache(hybrid);
+    addShutdownHook(() => hybrid.close());
+
+    logger.info('Redis inbound webhook dedup cache wired', undefined, {
+      component: 'inbound-webhook-dedup',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for inbound webhook dedup — falling back to in-memory cache',
+      undefined,
+      {
+        component: 'inbound-webhook-dedup',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    setInboundWebhookDedupCache(new InMemoryDedupCache());
   }
 }
 
@@ -384,9 +427,15 @@ export function createApp(options: AppOptions = {}): Express {
   const appConfig = options.config ?? loadConfig();
   void wireIdempotencyStore(appConfig);
   void wireStreamEventDedupCache(appConfig);
+  void wireInboundWebhookDedupCache(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
   void wireAdminStateLock(appConfig);
   void wireIndexerLeaderElection(appConfig);
+
+  // Configure mTLS enforcement for indexer worker connections.
+  // When INDEXER_MTLS_REQUIRED is true (default in production), non-TLS
+  // connections are rejected (fail-closed).
+  setMtlsRequired(appConfig.indexerMtlsRequired);
 
   // Optional grpc.health.v1.Health service for Kubernetes-native gRPC probes,
   // on a separate port from the HTTP server so it never competes with API
@@ -408,15 +457,20 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(deploymentSlotMiddleware);
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
+  // Correlation ID must run before express.json() so req.correlationId is available
+  // even when JSON parsing throws and the error handler fires immediately.
+  // It must also run before early-reject middlewares (body size, content type) 
+  // so that rejected requests still carry a correlation ID.
+  app.use(correlationIdMiddleware);
+  // Canary routing runs immediately after correlation-ID assignment so that
+  // every canary-tagged request carries a correlation ID end-to-end in logs.
+  app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);
-  // Correlation ID must run before express.json() so req.correlationId is available
-  // even when JSON parsing throws and the error handler fires immediately.
-  app.use(correlationIdMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
   app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
@@ -451,7 +505,7 @@ export function createApp(options: AppOptions = {}): Express {
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
-  app.use('/api/streams', streamsRouter);
+  app.use('/api/streams', csrfMiddleware, streamsRouter);
   app.use('/api/admin', adminRouter);
   app.use('/internal/indexer', indexerRouter);
   app.use('/internal/webhooks', webhooksRouter);
@@ -471,7 +525,7 @@ export function createApp(options: AppOptions = {}): Express {
   });
 
   app.use((req: Request, res: Response) => {
-    const requestId = req.correlationId ?? req.id;
+    const requestId = req.correlationId;
     res.status(404).json(
       errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId),
     );
