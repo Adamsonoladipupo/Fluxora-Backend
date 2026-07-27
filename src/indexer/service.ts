@@ -1202,7 +1202,7 @@ export class IndexerIngestionService {
     bucket.timestamps = bucket.timestamps.filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
     if (bucket.timestamps.length >= MAX_RATE_LIMIT_REQUESTS) {
       warn('Indexer ingest rate limit exceeded', { actor, limit: MAX_RATE_LIMIT_REQUESTS, windowMs: RATE_LIMIT_WINDOW_MS });
-      throw new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, 'indexer ingest rate limit exceeded', 429, {
+      throw new ApiError(429, ApiErrorCode.TOO_MANY_REQUESTS, 'indexer ingest rate limit exceeded', {
         retryAfterSeconds: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000),
       });
     }
