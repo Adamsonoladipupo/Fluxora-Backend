@@ -1,20 +1,28 @@
-# Security Guidelines & Audit Logging
+# Security: SQL Injection and Dependency Audit
 
-## Indexer Worker mTLS Connections
+## SQL Injection Regression Tests
 
-The connection between the backend and the indexer worker operates over a mutually authenticated TLS (mTLS) session. This is a high-value trust boundary.
+We exercise repository entrypoints with adversarial inputs to confirm that
+parameterized `node-postgres` queries do not allow SQL injection. Tests live
+in `tests/security/streamRepository.sqli.test.ts` and use payloads from
+`tests/security/fixtures/sqliPayloads.ts`.
 
-### Certificate Validation Failures
+When running in CI against a real Postgres instance, ensure the test DB is
+isolated and reset between runs.
 
-Whenever client-certificate validation fails for an indexer connection, the backend records the failure to prevent misconfigurations or active attacks from going unnoticed. 
+## Dependency audit (pnpm)
 
-**Logging Behavior:**
-- An immutable entry is written to the structured audit log with the action `MTLS_VALIDATION_FAILED`.
-- The entry captures public certificate fields (e.g., subject, issuer, serial number) and a generalized failure reason (e.g., `EXPIRED_CERT`, `UNKNOWN_CA`).
-- **Private key material is never logged.**
+The repository's CI will run `pnpm audit --audit-level=high --json` and
+fail the build on any high/critical advisories unless an explicit
+exception is recorded in `.pnpm-audit-exceptions` (see CI docs).
 
-**Metrics and Alerting:**
-- A Prometheus counter `indexer_mtls_validation_failures_total` is incremented.
-- This metric is labeled by `reason`, allowing operators to set up alerts for repeated failures.
+## mTLS Client Certificate Validation
 
-If validation failures spike, operators should query the `audit_logs` table (or `/api/audit` endpoint) for more detailed correlations and investigate the corresponding clients.
+The indexer worker uses a mutual TLS (mTLS) connection as a high-value trust boundary between the chain-indexing process and the backend.
+
+To detect misconfiguration or active attacks, any client-certificate validation failure on this connection generates a structured audit log entry (`INDEXER_MTLS_FAILURE`). This log captures:
+- The distinct failure reason (e.g., expired certificate, unknown CA, missing certificate).
+- The certificate's `subject`, `issuer`, and `serialNumber` (if provided).
+- It strictly **excludes** any private key material or full PEM blobs.
+
+Failures also increment the `indexer_mtls_validation_failures_total` Prometheus counter, which includes a `reason` label for granular alerting and faster triage.

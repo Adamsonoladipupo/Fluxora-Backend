@@ -51,12 +51,37 @@ import {
   _resetStreams,
   setStreamListingDependencyState,
   setIdempotencyDependencyState,
+  fingerprintInput,
+  enforceStreamScope,
+  getFeatureFlagRequesterId,
 } from '../../src/routes/streams.js';
 import { initializeConfig } from '../../src/config/env.js';
 import { generateToken } from '../../src/lib/auth.js';
+import type { Request } from 'express';
 
 // Initialize config before importing anything that needs it
 initializeConfig();
+
+describe('getFeatureFlagRequesterId', () => {
+  it('prefers authenticated API key id over header and IP', () => {
+    const req = {
+      keyId: 'key-record-1',
+      headers: { 'x-api-key': 'raw-key' },
+      ip: '203.0.113.10',
+    } as unknown as Request;
+
+    expect(getFeatureFlagRequesterId(req)).toBe('key:key-record-1');
+  });
+
+  it('falls back to raw API key header before IP', () => {
+    const req = {
+      headers: { 'x-api-key': 'raw-key' },
+      ip: '203.0.113.10',
+    } as unknown as Request;
+
+    expect(getFeatureFlagRequesterId(req)).toBe('api-key:raw-key');
+  });
+});
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -248,8 +273,178 @@ describe('streams routes', () => {
       mockGetById.mockRejectedValue(new PoolExhaustedError());
       expect((await request(app).get('/api/streams/stream-x')).status).toBe(503);
     });
+
+    // ── Conditional GET (RFC 7232) ───────────────────────────────────────
+
+    it('returns 304 when If-None-Match matches the ETag', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', etag);
+      expect(res.status).toBe(304);
+      expect(res.text).toBe('');
+      expect(res.headers['etag']).toBe(etag);
+    });
+
+    it('returns 304 for If-None-Match: *', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', '*');
+      expect(res.status).toBe(304);
+      expect(res.text).toBe('');
+    });
+
+    it('returns 304 when If-None-Match is a comma-separated list containing the ETag', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', `W/"other", ${etag}, W/"another"`);
+      expect(res.status).toBe(304);
+    });
+
+    it('returns 200 when If-None-Match does not match', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', 'W/"some-other-tag"');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.stream.id).toBe('stream-abc-0');
+    });
+
+    it('returns 200 when If-None-Match is absent', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app).get('/api/streams/stream-abc-0');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+
+    it('sets ETag and Last-Modified headers on 304', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({
+        id: 'stream-abc-0', updated_at: '2024-01-01T00:00:00.000Z',
+      }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', etag);
+      expect(res.status).toBe(304);
+      expect(res.headers['etag']).toBeDefined();
+      expect(res.headers['last-modified']).toBeDefined();
+    });
+
+    it('304 has no body', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', etag);
+      expect(res.status).toBe(304);
+      expect(res.text).toBe('');
+    });
+
+    it('does not break the success envelope shape for 200', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', 'W/"non-matching"');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data).toBeDefined();
+      expect(res.body.data.stream).toBeDefined();
+      expect(res.body.meta.timestamp).toBeDefined();
+    });
   });
 
+
+  // ── fingerprintInput() key-order stability ───────────────────────────────
+
+  describe('fingerprintInput()', () => {
+    it('produces the same digest regardless of NormalizedCreateInput key insertion order', () => {
+      const values = {
+        sender:        'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient:     'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+        depositAmount: '1000',
+        ratePerSecond: '10',
+        startTime:     1700000000,
+        endTime:       0,
+      };
+
+      // Object A: properties in canonical (sorted) order
+      const objA: Record<string, unknown> = {
+        depositAmount: values.depositAmount,
+        endTime:       values.endTime,
+        ratePerSecond: values.ratePerSecond,
+        recipient:     values.recipient,
+        sender:        values.sender,
+        startTime:     values.startTime,
+      };
+
+      // Object B: properties in reverse order
+      const objB: Record<string, unknown> = {
+        startTime:     values.startTime,
+        sender:        values.sender,
+        recipient:     values.recipient,
+        ratePerSecond: values.ratePerSecond,
+        endTime:       values.endTime,
+        depositAmount: values.depositAmount,
+      };
+
+      // Object C: properties in insertion-order (as returned by normalizeCreateInput)
+      const objC: Record<string, unknown> = {
+        sender:        values.sender,
+        recipient:     values.recipient,
+        depositAmount: values.depositAmount,
+        ratePerSecond: values.ratePerSecond,
+        startTime:     values.startTime,
+        endTime:       values.endTime,
+      };
+
+      const fpA = fingerprintInput(objA as Parameters<typeof fingerprintInput>[0]);
+      const fpB = fingerprintInput(objB as Parameters<typeof fingerprintInput>[0]);
+      const fpC = fingerprintInput(objC as Parameters<typeof fingerprintInput>[0]);
+
+      expect(fpA).toBe(fpB);
+      expect(fpB).toBe(fpC);
+    });
+
+    it('produces different digests for different input values', async () => {
+      const base: Parameters<typeof fingerprintInput>[0] = {
+        sender:        'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient:     'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+        depositAmount: '1000',
+        ratePerSecond: '10',
+        startTime:     1700000000,
+        endTime:       0,
+      };
+
+      const modified = { ...base, depositAmount: '9999' };
+      expect(fingerprintInput(base)).not.toBe(fingerprintInput(modified));
+    });
+
+    it('returns a 64-character hex string', () => {
+      const input: Parameters<typeof fingerprintInput>[0] = {
+        sender:        'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient:     'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+        depositAmount: '1000',
+        ratePerSecond: '10',
+        startTime:     1700000000,
+        endTime:       0,
+      };
+      const fp = fingerprintInput(input);
+      expect(fp).toMatch(/^[a-f0-9]{64}$/);
+    });
+  });
 
   // ── POST /api/streams — idempotency ──────────────────────────────────────
 
@@ -558,6 +753,35 @@ describe('streams routes', () => {
       expect(res.body.data.depositAmount).toBe('0.0000001');
       expect(res.body.data.ratePerSecond).toBe('0.0000116');
     });
+
+    it('accepts large and high-precision decimal strings without numeric coercion', async () => {
+      const preciseBody = {
+        ...validBody,
+        depositAmount: '9007199254740993.000000000000000001',
+        ratePerSecond: '+0.000000000000000001',
+      };
+      mockUpsertStream.mockResolvedValue({
+        created: true,
+        stream: makeDbRecord({
+          amount: '9007199254740993.000000000000000001',
+          rate_per_second: '+0.000000000000000001',
+        }),
+      });
+
+      const res = await post(preciseBody, uniqueKey());
+
+      expect(res.status).toBe(201);
+      expect(mockUpsertStream).toHaveBeenCalledTimes(1);
+      expect(mockUpsertStream.mock.calls[0]?.[0]).toEqual(
+        expect.objectContaining({
+          amount: '9007199254740993.000000000000000001',
+          remaining_amount: '9007199254740993.000000000000000001',
+          rate_per_second: '+0.000000000000000001',
+        }),
+      );
+      expect(res.body.data.depositAmount).toBe('9007199254740993.000000000000000001');
+      expect(res.body.data.ratePerSecond).toBe('+0.000000000000000001');
+    });
   });
 
   // ── DELETE /api/streams/:id ───────────────────────────────────────────────
@@ -683,5 +907,48 @@ describe('streams routes', () => {
       const res = await post(validBody, uniqueKey('envelope-fresh')).expect(201);
       expect(res.body.meta.idempotencyReplayed).toBeUndefined();
     });
+  });
+});
+
+// ── enforceStreamScope middleware ─────────────────────────────────────────────
+
+describe('enforceStreamScope', () => {
+  function mockReqRes(overrides: Record<string, unknown> = {}) {
+    const req: Record<string, unknown> = { ...overrides };
+    const res = {
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    };
+    const next = vi.fn();
+    return { req, res, next } as unknown as Parameters<typeof enforceStreamScope>;
+  }
+
+  it('calls next() when req.user is not set (unauthenticated)', () => {
+    const { req, res, next } = mockReqRes();
+    enforceStreamScope(req as any, res as any, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect((req as any).callerAddress).toBeUndefined();
+  });
+
+  it('calls next() when user role is operator (bypass)', () => {
+    const { req, res, next } = mockReqRes({ user: { address: 'GABCDEF123', role: 'operator' } });
+    enforceStreamScope(req as any, res as any, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect((req as any).callerAddress).toBeUndefined();
+  });
+
+  it('sets callerAddress and calls next() for authenticated user with address', () => {
+    const { req, res, next } = mockReqRes({ user: { address: 'GXYZ789', role: 'viewer' } });
+    enforceStreamScope(req as any, res as any, next);
+    expect((req as any).callerAddress).toBe('GXYZ789');
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 500 when authenticated user has no address', () => {
+    const { req, res, next } = mockReqRes({ user: { address: undefined, role: 'viewer' } });
+    enforceStreamScope(req as any, res as any, next);
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    expect(next).not.toHaveBeenCalled();
   });
 });

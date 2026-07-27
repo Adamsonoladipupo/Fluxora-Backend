@@ -12,8 +12,17 @@ declare global {
       user?: UserPayload;
       /** Attached by correlationId middleware. */
       correlationId?: string;
-      /** Attached by requestIdMiddleware (errors.ts). */
-      id?: string;
+      /** Attached by apiVersion middleware based on the Accept-Version header. */
+      apiVersion?: string;
+      /** Attached by enforceStreamScope middleware; the normalized caller address. */
+      callerAddress?: string;
+      /**
+       * Attached by canaryRoutingMiddleware.
+       * `true`  — this request falls within the canary traffic slice.
+       * `false` — this request is on the stable traffic slice.
+       * `undefined` — middleware has not yet run (e.g. very early in the stack).
+       */
+      isCanary?: boolean;
     }
   }
 }

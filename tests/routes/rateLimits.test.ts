@@ -2,10 +2,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import express from 'express';
 import { createApp } from '../../src/app.js';
-import { resetRuntimeRateLimitConfig } from '../../src/config/rateLimits.js';
+import { resetRuntimeRateLimitConfig, MAX_WINDOW_MS } from '../../src/config/rateLimits.js';
 import { createRateLimiter } from '../../src/middleware/rateLimiter.js';
 import { createRateLimitsRouter } from '../../src/routes/rateLimits.js';
 import { getRateLimitConfig } from '../../src/config/rateLimits.js';
+import { InMemoryStore } from '../../src/redis/rateLimitStore.js';
 
 const ADMIN_KEY = 'test-admin-key';
 
@@ -33,7 +34,7 @@ function createTestEnv(overrides: Record<string, string | undefined> = {}) {
 // Create a minimal test app for rate limiting tests
 function createTestApp(env: Record<string, string | undefined>) {
   const app = express();
-  const rateLimiter = createRateLimiter(env);
+  const rateLimiter = createRateLimiter(env, new InMemoryStore());
   
   // Add JSON body parsing middleware (required for PUT requests)
   app.use(express.json());
@@ -204,7 +205,7 @@ describe('API endpoints rate limiting', () => {
     // This test needs route-specific config, so let's update our test app
     const env = createTestEnv({ RATE_LIMIT_IP_MAX: '1000' });
     const app = express();
-    const rateLimiter = createRateLimiter(env);
+    const rateLimiter = createRateLimiter(env, new InMemoryStore());
     
     // Add rate limiter middleware
     app.use(rateLimiter);
@@ -229,7 +230,7 @@ describe('API endpoints rate limiting', () => {
     // This test needs route-specific config with write limits
     const env = createTestEnv({ RATE_LIMIT_IP_MAX: '1000' });
     const app = express();
-    const rateLimiter = createRateLimiter(env);
+    const rateLimiter = createRateLimiter(env, new InMemoryStore());
     
     // Add rate limiter middleware
     app.use(rateLimiter);
@@ -387,6 +388,54 @@ describe('PUT /api/rate-limits/config', () => {
     const app = createTestApp(createTestEnv());
     const res = await authed(
       request(app).put('/api/rate-limits/config').send({ ip: { windowMs: 500 } }),
+    ).expect(400);
+    expect(res.body.error).toMatch(/windowMs/i);
+  });
+
+  it('returns 400 for windowMs above MAX_WINDOW_MS', async () => {
+    const app = createTestApp(createTestEnv());
+    const res = await authed(
+      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: MAX_WINDOW_MS + 1 } }),
+    ).expect(400);
+    expect(res.body.error).toMatch(/windowMs must not exceed/i);
+  });
+
+  it('accepts windowMs at the minimum bound (1000)', async () => {
+    const app = createTestApp(createTestEnv());
+    const res = await authed(
+      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: 1000 } }),
+    ).expect(200);
+    expect(res.body.config.ip.windowMs).toBe(1000);
+  });
+
+  it('accepts windowMs at the maximum bound (MAX_WINDOW_MS)', async () => {
+    const app = createTestApp(createTestEnv());
+    const res = await authed(
+      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: MAX_WINDOW_MS } }),
+    ).expect(200);
+    expect(res.body.config.ip.windowMs).toBe(MAX_WINDOW_MS);
+  });
+
+  it('accepts windowMs in the middle of the valid range', async () => {
+    const app = createTestApp(createTestEnv());
+    const res = await authed(
+      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: 120_000 } }),
+    ).expect(200);
+    expect(res.body.config.ip.windowMs).toBe(120_000);
+  });
+
+  it('returns 400 for negative windowMs', async () => {
+    const app = createTestApp(createTestEnv());
+    const res = await authed(
+      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: -1 } }),
+    ).expect(400);
+    expect(res.body.error).toMatch(/windowMs/i);
+  });
+
+  it('returns 400 for non-integer windowMs', async () => {
+    const app = createTestApp(createTestEnv());
+    const res = await authed(
+      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: 123.456 } }),
     ).expect(400);
     expect(res.body.error).toMatch(/windowMs/i);
   });
