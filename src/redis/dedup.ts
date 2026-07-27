@@ -38,7 +38,7 @@ export function __resetDedupForTest(): void {
   lastFallbackLog = 0;
 }
 
-export class InMemoryDedupCache implements DedupCache {`n    /**`n     * FIFO eviction: when size reaches DEDUP_CACHE_MAX (10000), the`n     * oldest-inserted key is evicted. Under sustained load at capacity,`n     * this is a one-in-one-out FIFO.`n     *`n     * Trade-off: evicted keys are treated as new (false negative) if`n     * replayed. This is the fallback for HybridDedupCache when Redis is`n     * unavailable; during a Redis outage, dedup degrades to best-effort`n     * on the most recent DEDUP_CACHE_MAX events.`n     */
+export class InMemoryDedupCache implements DedupCache {
     /** FIFO eviction: when size reaches DEDUP_CACHE_MAX, the oldest-inserted key is evicted.
      * Under sustained load at capacity, this is a one-in-one-out FIFO.
      * Trade-off: evicted keys will be treated as new (false negative) if replayed.

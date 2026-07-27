@@ -498,3 +498,54 @@ that occur **during** the fan-out iteration:
   for the disconnected client.
 - Pending batch-accumulator timers for the disconnected client are cancelled
   by `onDisconnect`, preventing stale frame delivery.
+
+## Broadcast Authorization & Audit
+
+All WebSocket broadcasts originate from the blockchain indexer service, not from HTTP API endpoints. This section documents the broadcast trigger surface and authorization model.
+
+### Trigger Surface
+
+Broadcasts are triggered exclusively by `src/services/streamEventService.ts` when processing blockchain events:
+
+| Event Type | Function | Broadcast Payload |
+|------------|----------|-------------------|
+| `stream.created` | `processStreamCreated()` | Full stream details (id, parties, amounts, contract metadata) |
+| `stream.updated` | `processStreamUpdated()` | Updated fields (status, amounts, timestamps) |
+| `stream.cancelled` | `processStreamCancelled()` | Stream ID and cancellation status |
+
+### Authorization Model
+
+**No admin authentication is required** for broadcasts because:
+
+1. **Indexer-only origin**: Broadcasts are triggered by the blockchain indexer service ingesting on-chain events, not by HTTP API requests
+2. **No user-controlled path**: There is no HTTP endpoint that allows external users to trigger broadcasts directly
+3. **Chain of trust**: The indexer processes verified blockchain events from the Stellar network, establishing trust at the chain level
+
+The broadcast path:
+```
+Blockchain Event → Indexer Service → StreamEventService.process*() → Hub.broadcast() → WebSocket clients
+```
+
+### Audit Logging
+
+Every broadcast is logged via `recordAuditEvent()` with:
+
+- **Action**: `STREAM_BROADCAST`
+- **Resource**: `stream`
+- **Resource ID**: Stream ID
+- **Metadata**: Event type (`stream.created`, `stream.updated`, `stream.cancelled`) and event ID
+
+This provides a complete audit trail of all broadcasts for compliance and debugging purposes.
+
+### Security Properties
+
+- **No spoofing risk**: Broadcasts cannot be triggered by external HTTP requests
+- **Idempotency**: The indexer deduplicates events before broadcasting
+- **Recipient filtering**: Broadcasts include `recipientAddress` for client-side filtering
+- **Payload validation**: All broadcast payloads are validated before transmission
+
+### Testing
+
+The broadcast authorization model is tested in:
+- `tests/integration/broadcast-auth.test.ts` — Verifies no HTTP endpoint can trigger broadcasts
+- `tests/services/streamEventService.test.ts` — Validates audit logging for all event types
