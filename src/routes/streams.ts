@@ -67,6 +67,7 @@ import {
   tooManyRequests,
 } from '../middleware/errorHandler.js';
 import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
+import { canonicalizeBody } from '../middleware/idempotency.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
@@ -387,9 +388,9 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   if (!parseResult.success) {
     const formatted = formatZodIssues(parseResult.issues);
     throw new ApiError(
+      400,
       ApiErrorCode.VALIDATION_ERROR,
       formatted[0]?.message ?? 'Validation failed',
-      400,
       formatted.map((e) => e.message).join('; '),
     );
   }
@@ -402,9 +403,9 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   );
   if (!amountValidation.valid) {
     throw new ApiError(
+      400,
       ApiErrorCode.VALIDATION_ERROR,
       'Invalid decimal string format for amount fields',
-      400,
       { errors: amountValidation.errors.map((e) => ({ field: e.field, code: e.code, message: e.message })) },
     );
   }
@@ -980,9 +981,9 @@ streamsRouter.post(
           action: 'conflict',
         });
         throw new ApiError(
+          409,
           ApiErrorCode.CONFLICT,
           'Idempotency-Key has already been used for a different request payload',
-          409,
           { hint: 'Use a new Idempotency-Key or retry with the original request body' },
         );
       }
@@ -1096,7 +1097,7 @@ streamsRouter.delete(
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, 'cancelled');
     if (!guard.ok) {
-      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+      throw new ApiError(409, ApiErrorCode.CONFLICT, guard.message, {
         streamId: id,
         currentStatus: record!.status,
       });
@@ -1107,9 +1108,9 @@ streamsRouter.delete(
     } catch (err) {
       if (err instanceof StatusConflictError) {
         throw new ApiError(
+          409,
           ApiErrorCode.CONFLICT,
           err.message,
-          409,
           {
             streamId: id,
             currentStatus: record!.status,
@@ -1162,7 +1163,7 @@ streamsRouter.patch(
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, newStatus as ApiStreamStatus);
     if (!guard.ok) {
-      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+      throw new ApiError(409, ApiErrorCode.CONFLICT, guard.message, {
         streamId: id,
         currentStatus: record!.status,
         requestedStatus: newStatus,
@@ -1176,9 +1177,9 @@ streamsRouter.patch(
     } catch (err) {
       if (err instanceof StatusConflictError) {
         throw new ApiError(
+          409,
           ApiErrorCode.CONFLICT,
           err.message,
-          409,
           {
             streamId: id,
             currentStatus: record!.status,
