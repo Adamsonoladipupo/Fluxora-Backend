@@ -148,6 +148,8 @@ importers:
         specifier: ^3.2.6
         version: 3.2.7(@types/node@20.19.43)(tsx@4.22.4)(yaml@2.9.0)
 
+  sdk/typescript: {}
+
 packages:
 
   '@ampproject/remapping@2.3.0':
