@@ -23,6 +23,8 @@ declare global {
        * `undefined` — middleware has not yet run (e.g. very early in the stack).
        */
       isCanary?: boolean;
+      /** Attached by authenticateApiKey middleware; the api_keys.id (cuid2). */
+      keyId?: string;
     }
   }
 }
