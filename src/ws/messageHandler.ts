@@ -3,6 +3,7 @@ import type { StreamEventReplayFilter } from '../db/types.js';
 import { STELLAR_PUBLIC_KEY_REGEX } from '../validation/schemas.js';
 
 const MAX_FILTER_VALUE_LENGTH = 256;
+const MAX_INBOUND_MESSAGE_BYTES = 4_096;
 const STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE = 6 << 3;
 const STELLAR_STRKEY_LENGTH = 56;
 const STELLAR_STRKEY_DECODED_LENGTH = 35;
@@ -213,6 +214,30 @@ function validationMessage(issues: z.ZodIssue[]): string {
  * @param raw Parsed JSON value from the client frame.
  * @returns The normalized WebSocket client message or a validation error.
  */
+export function validateWebSocketMessage(data: unknown): WsMessageParseResult {
+  if (typeof data !== 'string') {
+    return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a string' };
+  }
+
+  const byteLength = Buffer.byteLength(data, 'utf8');
+  if (byteLength > MAX_INBOUND_MESSAGE_BYTES) {
+    return {
+      ok: false,
+      code: 'INVALID_MESSAGE',
+      message: `Message exceeds ${MAX_INBOUND_MESSAGE_BYTES} bytes (got ${byteLength})`,
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return { ok: false, code: 'INVALID_MESSAGE', message: 'Invalid JSON' };
+  }
+
+  return parseWsClientMessage(parsed);
+}
+
 export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
   if (!isObject(raw)) {
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a JSON object' };
