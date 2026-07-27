@@ -111,7 +111,7 @@ export interface IWebhookDeliveryStore {
   get(id: string): WebhookDelivery | undefined;
   getByDeliveryId(deliveryId: string): WebhookDelivery | undefined;
   updateStatus(id: string, status: WebhookDeliveryStatus): void;
-  addToOutbox(item: Omit<OutboxItem, 'id'>): string;
+  addToOutbox(item: Omit<OutboxItem, 'id' | 'status'>): string;
   getReadyOutboxItems(now?: number): OutboxItem[];
   removeFromOutbox(id: string): boolean;
   updateOutboxItemAttempt(id: string, attempts: number): void;
@@ -226,9 +226,9 @@ export class WebhookDeliveryStore implements IWebhookDeliveryStore {
   /**
    * Add item to outbox for reliable delivery
    */
-  addToOutbox(item: Omit<OutboxItem, 'id'>): string {
+  addToOutbox(item: Omit<OutboxItem, 'id' | 'status'>): string {
     const id = `outbox_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const outboxItem: OutboxItem = { ...item, id, status: item.status ?? 'pending' };
+    const outboxItem: OutboxItem = { ...item, id, status: 'pending' };
 
     this.outbox.set(id, outboxItem);
 
@@ -249,6 +249,29 @@ export class WebhookDeliveryStore implements IWebhookDeliveryStore {
     });
 
     return id;
+  }
+
+  /**
+   * Hydrate a full outbox item (with pre-existing id and status) into the
+   * in-memory mirror.  Used by `PgWebhookDeliveryStore.hydrate()` to
+   * restore persisted rows on startup.
+   *
+   * This method intentionally accepts the complete `OutboxItem` including
+   * `id` and `status` — it is **not** a general-purpose enqueue and
+   * should only be called during hydration.
+   */
+  hydrateOutboxItem(item: OutboxItem): string {
+    this.outbox.set(item.id, item);
+
+    const priority = item.priority;
+    if (!this.outboxPriorityQueue.has(priority)) {
+      this.outboxPriorityQueue.set(priority, []);
+    }
+    this.outboxPriorityQueue.get(priority)!.push(item);
+
+    this.metrics.outboxItems++;
+
+    return item.id;
   }
 
   /**

@@ -134,6 +134,9 @@ export interface TracerConfig {
 
   /** Custom hook handlers. */
   hooks?: TracerHooks;
+
+  /** Sampling strategy configuration. When omitted, all spans are kept (100% sampling). */
+  sampling?: SamplingConfig;
 }
 
 /**
@@ -193,6 +196,25 @@ export class Tracer {
       return this.createNoOpSpan(context);
     }
 
+    // Head-based sampling decision: skip span creation when sampled out.
+    if (this.config.sampling) {
+      const sampling = this.config.sampling;
+      if (sampling.strategy === 'never') {
+        return this.createNoOpSpan(context);
+      }
+      if (sampling.strategy === 'head') {
+        let rate = sampling.sampleRate;
+        const route = context.tags?.['route'] as string | undefined;
+        if (route && sampling.perRouteOverrides) {
+          const override = resolvePerRouteOverride(route, sampling.perRouteOverrides);
+          if (override !== undefined) rate = override;
+        }
+        if (!shouldSampleHead(context.traceId, rate)) {
+          return this.createNoOpSpan(context);
+        }
+      }
+    }
+
     const spanId = String(++this.spanIdCounter);
     const span: Span = {
       context: { ...context, spanId },
@@ -220,6 +242,11 @@ export class Tracer {
       return;
     }
 
+    // Span was sampled out at head or is a no-op — nothing to export.
+    if (!this.activeSpans.has(span.context.spanId)) {
+      return;
+    }
+
     span.endTimeMs = Date.now();
     span.durationMs = span.endTimeMs - span.startTimeMs;
     span.status = status;
@@ -228,6 +255,13 @@ export class Tracer {
     }
 
     this.activeSpans.delete(span.context.spanId);
+
+    // Tail-based sampling: drop non-error spans that fall below the sample rate.
+    if (this.config.sampling?.strategy === 'tail') {
+      if (!shouldSampleTail(span, this.config.sampling)) {
+        return;
+      }
+    }
 
     // Call hooks and OpenTelemetry
     this.safeCall(() => this.config.hooks?.onSpanEnd?.(span));

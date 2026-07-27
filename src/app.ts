@@ -60,6 +60,7 @@ import { successResponse, errorResponse } from './utils/response.js';
 import { docsRouter } from './routes/docs.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
 import { startBackgroundJobs } from './jobs/queue.js';
+import { csrfMiddleware } from './middleware/csrf.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -504,7 +505,7 @@ export function createApp(options: AppOptions = {}): Express {
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
-  app.use('/api/streams', streamsRouter);
+  app.use('/api/streams', csrfMiddleware, streamsRouter);
   app.use('/api/admin', adminRouter);
   app.use('/internal/indexer', indexerRouter);
   app.use('/internal/webhooks', webhooksRouter);

@@ -485,3 +485,124 @@ ON CONFLICT (happened_at, event_id) DO NOTHING
 Using only `(event_id)` raises a PostgreSQL error
 (`there is no unique or exclusion constraint matching the ON CONFLICT
 specification`) on partitioned tables and was corrected as part of issue #932.
+
+---
+
+## Background Job Queue (pg-boss)
+
+### Overview
+
+Fluxora uses [pg-boss](https://github.com/timgit/pg-boss) for Postgres-backed background job processing. pg-boss provides durable, at-least-once job delivery with built-in retry, exponential backoff, cron scheduling, and dead letter queues — all within PostgreSQL.
+
+### The JobQueue Class
+
+Located at `src/jobs/queue.ts`, the `JobQueue` class wraps pg-boss and integrates with the application's existing `pg.Pool`:
+
+```typescript
+import { JobQueue, getJobQueue, setJobQueue } from './src/jobs/queue.js';
+
+const queue = new JobQueue(pool);
+setJobQueue(queue);
+```
+
+### Configuration
+
+pg-boss creates its own lightweight connection pool (2–4 connections, derived from the application pool's `max`). It uses the `pgboss` schema inside the same PostgreSQL database.
+
+Retry and expiration settings can be configured per job registration or per send:
+
+| Option | Default | Description |
+|---|---|---|
+| `retryLimit` | `2` | Max retries before the job is dead-lettered |
+| `retryDelay` | `60` | Base delay in seconds between retries |
+| `retryBackoff` | `true` | Exponential backoff enabled by default |
+| `retryDelayMax` | — | Cap for backoff-delay growth |
+| `expireInSeconds` | `900` | Max seconds a job may stay in active state |
+| `deadLetter` | — | Queue name to route terminally-failed jobs to |
+
+### Job Handler Registration
+
+Handlers are registered by name before the queue is started:
+
+```typescript
+queue.register('send-email', async (ctx) => {
+  const { id, data } = ctx;
+  await emailService.send(data);
+}, {
+  retryLimit: 3,
+  retryDelay: 30,
+  retryBackoff: true,
+});
+```
+
+The handler receives a `JobHandlerContext` with `id`, `name`, and `data`. Throwing from the handler triggers pg-boss's retry mechanism.
+
+### Sending Jobs
+
+```typescript
+await queue.send('send-email', { to: 'user@example.com', template: 'welcome' }, {
+  retryLimit: 3,
+  deadLetter: 'job_dead_letter_queue',
+});
+```
+
+### Scheduling with Cron
+
+```typescript
+await queue.schedule('partition-maintenance', '0 0 * * *', undefined, {
+  retryLimit: 2,
+  retryDelay: 60,
+});
+```
+
+### Retry and Dead Letter Behavior
+
+1. If a handler throws, pg-boss retries the job with exponential backoff (`retryDelay * 2^retryCount` with jitter).
+2. After exhausting `retryLimit` retries, the job is moved to the configured dead letter queue (`deadLetter` option).
+3. A custom `job_dead_letter` table (see migration below) stores additional metadata about failed jobs for operational inspection.
+
+### Lifecycle
+
+```typescript
+await queue.start();  // Begins processing — registers work handlers
+await queue.stop();   // Graceful shutdown — stops workers and releases resources
+```
+
+### Singleton Access
+
+The module exports `getJobQueue()` / `setJobQueue()` following the same pattern as `pool.ts`:
+
+```typescript
+import { getJobQueue } from './src/jobs/queue.js';
+const queue = getJobQueue();
+if (queue) {
+  await queue.send('my-job', data);
+}
+```
+
+### Migration
+
+Migration `migrations/20260727000000_job_dead_letter.ts` creates the `job_dead_letter` table for jobs that have exhausted retries:
+
+```sql
+CREATE TABLE IF NOT EXISTS job_dead_letter (
+  id BIGSERIAL PRIMARY KEY,
+  job_name TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  payload JSONB,
+  error_message TEXT,
+  failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  retry_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_job_dead_letter_name ON job_dead_letter(job_name);
+```
+
+Apply with:
+
+```bash
+pnpm run migrate
+```
+
+### Tests
+
+Unit tests for the queue are in `tests/jobs/queue.test.ts`. They mock pg-boss using `vi.mock()` to test the `JobQueue` class independently of a real database.

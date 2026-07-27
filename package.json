@@ -25,7 +25,9 @@
     "docker:seed": "docker-compose exec indexer pnpm run seed",
     "docker:test": "docker-compose exec indexer pnpm test",
     "generate:sdk:python": "node scripts/generate-sdk-python.mjs",
-    "check:sdk:python": "node scripts/generate-sdk-python.mjs --check"
+    "check:sdk:python": "node scripts/generate-sdk-python.mjs --check",
+    "generate:sdk:ts": "node scripts/generate-sdk-ts.mjs",
+    "check:sdk:ts": "node scripts/generate-sdk-ts.mjs --check"
   },
   "keywords": [
     "indexer",
@@ -57,6 +59,7 @@
     "jsonwebtoken": "^9.0.3",
     "node-pg-migrate": "^7.6.0",
     "pg": "^8.11.3",
+    "pg-boss": "^12.26.3",
     "prom-client": "^15.0.0",
     "protobufjs": "7.6.5",
     "swagger-ui-express": "5.0.1",
