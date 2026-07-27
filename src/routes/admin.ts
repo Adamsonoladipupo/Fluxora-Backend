@@ -24,6 +24,7 @@ import {
   listRestoreJobs,
   type RestoreJob,
 } from '../scripts/backup-retention.js';
+import { tenantRateLimitOverridesRouter } from './admin/tenantRateLimitOverrides.js';
 
 export const adminRouter = Router();
 
@@ -39,6 +40,9 @@ adminRouter.get('/status/read-only', (_req, res) => {
 
 // Every admin route requires a valid Bearer token.
 adminRouter.use(requireAdminAuth);
+
+// Per-tenant rate limit override management
+adminRouter.use('/rate-limits/overrides', tenantRateLimitOverridesRouter);
 
 /**
  * GET /api/admin/deprecations
