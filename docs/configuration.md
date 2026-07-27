@@ -180,3 +180,19 @@ log entry is emitted but the new value is **not** applied:
 applying it. No concurrent request can observe a partially-applied config.
 The feature flag map is replaced in a single JavaScript assignment, which is
 atomic in Node.js's single-threaded event loop.
+
+### Security guarantees
+
+- Restart-only variable names are logged on change, but their **values are never
+  included** in log output, preventing accidental secret leakage via log-shipping.
+- `reloadHotConfig()` returns a frozen (`Object.isFrozen`) object so no caller
+  can mutate the shared config snapshot.
+- The SIGHUP handler catches and logs all errors; a malformed environment after
+  a SIGHUP never kills the process.
+
+### Test isolation helper
+
+`resetStartupEnvSnapshot()` (exported from `src/config/env.ts`) resets the
+module-level startup snapshot back to `null`. It is intended **only** for unit
+tests that need to exercise `captureStartupEnvSnapshot()` in isolation without
+full module reloading. Never call it in production code.
