@@ -404,8 +404,7 @@ TRACING_ENABLED=true pnpm test -- --benchmark
 
 ### Follow-Up Work (Documented for Future Sprints)
 
-1. **Automatic instrumentation** — Instrument database driver, HTTP client, message queues without explicit calls
-   - Rationale: Reduces boilerplate, improves consistency
+1. ~~**Automatic instrumentation**~~ — **IMPLEMENTED** (issue #941). See the Automatic Instrumentation section below.
 
 2. ~~**W3C Traceparent support**~~ — **IMPLEMENTED** (issue #756). See the W3C Trace Context section below.
 
@@ -419,6 +418,45 @@ TRACING_ENABLED=true pnpm test -- --benchmark
 
 6. **Trace query API** — Add `/admin/traces` endpoint for operators to query spans
    - Rationale: Avoid log parsing for debugging; real-time query capability
+
+---
+
+## Automatic Instrumentation (issue #941)
+
+Fluxora registers `PgInstrumentation` and `HttpInstrumentation` (along with
+`ExpressInstrumentation` and `IORedisInstrumentation`) with the `NodeSDK`
+at startup so that every `pg.Pool.query` / `pg.Client.query` call and every
+outbound HTTP request automatically produces a child span — no manual
+`traceSpan()` wrapper required.
+
+### What is auto-instrumented
+
+| Library | Instrumentation class | Spans produced |
+|---------|-----------------------|----------------|
+| `pg` (Pool/Client) | `PgInstrumentation` | `pg.query` with `db.statement`, `db.parameters` attributes |
+| `http` / `https` | `HttpInstrumentation` | `HTTP <method>` for outbound requests; inbound server spans (suppressed for `/health` and `/metrics`) |
+| Express | `ExpressInstrumentation` | Route-handler and middleware spans |
+| ioredis | `IORedisInstrumentation` | `redis.<command>` spans |
+
+### Relationship with manual `traceSpan()`
+
+The manual `traceSpan()` helper (used in `src/db/pool.ts`, etc.) and the
+auto-instrumentation do **not** conflict. Auto-instrumented spans are
+produced by the OTel SDK patching the `pg` and `http` prototypes at module
+load time; `traceSpan()` creates application-level business spans via the
+hook-based tracer. Both appear in the trace tree — the auto-instrumented
+span is a child of the request span, and the manual span is a sibling.
+
+### Disabling auto-instrumentation
+
+Set `OTEL_SDK_DISABLED=true` to skip the entire OTel SDK (including all
+auto-instrumentation). There is currently no granular toggle to disable
+individual instrumentations.
+
+### Code references
+
+- SDK bootstrap: [`src/tracing/index.ts`](../src/tracing/index.ts) (`instrumentations` array)
+- Tests: [`tests/tracing/autoInstrumentation.test.ts`](../tests/tracing/autoInstrumentation.test.ts)
 
 ---
 

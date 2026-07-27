@@ -1,5 +1,11 @@
 # WebSocket Streams
 
+<!--
+  NatSpec / doc-comment style: this file documents both the public WebSocket
+  protocol and internal resilience mechanisms, with explicit security and
+  testing notes for each component.
+-->
+
 Fluxora exposes real-time treasury stream updates on `/ws/streams` using standard WebSockets.
 
 ## Connection Handshake
@@ -176,6 +182,100 @@ hub.on('backpressure', (event) => {
 It also writes a structured `ws_backpressure` warning log with the same metadata.
 The event and log intentionally exclude payload bodies, JWTs, API keys, and raw
 request headers.
+
+## Network Partition Resilience
+
+Fluxora's `StreamHub` is designed to tolerate network-partitioned clients —
+clients whose TCP connection accepts writes into the kernel send buffer but
+never reads or acknowledges data. In production, this occurs when a client's
+network drops inbound packets while keeping the TCP socket half-open (e.g.
+unplugged Wi-Fi, firewall silences inbound traffic, client process hangs).
+
+### Detection via `bufferedAmount`
+
+The hub checks `ws.bufferedAmount` before every outbound frame. When the
+remote peer stops reading, the kernel buffer fills and `bufferedAmount` grows.
+The hub acts at two thresholds:
+
+| Threshold                        | Action                                              |
+| -------------------------------- | --------------------------------------------------- |
+| `BACKPRESSURE_DROP_BYTES` (1 MiB) | Drop the frame for that client.                    |
+| `BACKPRESSURE_TERMINATE_BYTES` (4 MiB) | Drop the frame, terminate the connection, clean up subscriptions. |
+
+Both thresholds are configurable per-hub instance via
+`StreamHubOptions.dropBytes` / `StreamHubOptions.terminateBytes` or at
+runtime with `hub.setBackpressureThresholds({ dropBytes, terminateBytes })`.
+
+### Per-connection isolation
+
+Backpressure is applied independently per connection. A partitioned client
+never blocks delivery to healthy subscribers on the same stream. The hub
+iterates subscribers in a tight loop and skips or terminates slow sockets
+without `await` — no slow client can stall the broadcast.
+
+### Events and observability
+
+Each drop or termination emits a `backpressure` event:
+
+```ts
+hub.on('backpressure', (event) => {
+  // { action: 'drop' | 'terminate', streamId, eventId,
+  //   connectionId, bufferedAmount, thresholdBytes, timestamp }
+});
+```
+
+A structured `ws_backpressure` warning log is written with the same metadata.
+Neither the event nor the log includes payload bodies, JWTs, or user
+identifiers.
+
+### Testing with simulated network partitions
+
+The test fixture in `tests/ws/fixtures/slowClient.ts` provides
+`simulatePartition()` which emulates a full TCP receive-window stall:
+
+1. Sets a `partitioned` flag on the raw socket's `write` override.
+2. Each `ws.send()` call from that point forward increments an internal
+   `bufferedAmount` counter instead of writing to the real socket.
+3. The overridden write returns `true` (data accepted into the simulated OS
+   buffer) but never fires drain callbacks — the remote peer never acks.
+4. The hub sees `bufferedAmount` grow naturally with each broadcast and
+   applies the same drop/terminate thresholds as in production.
+
+See `tests/ws/ws.networkPartition.test.ts` for comprehensive tests covering:
+
+- `bufferedAmount` accumulation per broadcast
+- Drop-threshold crossing with backpressure event emission
+- Terminate-threshold crossing with connection cleanup
+- Bounded delivery latency to healthy peers during partition
+- Multiple partitioned clients handled independently
+- Subscription state cleanup after partition-triggered termination
+
+Example usage in a test:
+
+```ts
+const slow = await createSlowClient(port, hub);
+slow.subscribe('my-stream');
+slow.simulatePartition();
+
+// Each broadcast increases bufferedAmount naturally
+await hub.broadcast({ streamId: 'my-stream', eventId: 'e1', payload: {} });
+expect(slow.getBufferedAmount()).toBeGreaterThan(0);
+
+// Eventually thresholds are crossed
+await hub.broadcast({ streamId: 'my-stream', eventId: 'e2', payload: {} });
+// → backpressure event emitted, client may be terminated
+```
+
+### Security notes (partition handling)
+
+- No per-client unbounded queuing: the hub never queues messages for slow
+  clients beyond a single broadcast cycle.
+- Terminated connections have their subscriptions fully cleaned up:
+  `streamSubscriptions`, `recipientSubscriptions`, and per-client batch
+  accumulators are all purged.
+- The `backpressure` event intentionally excludes payloads, JWTs, and PII.
+- All termination is unidirectional (server originates close) — a partitioned
+  client cannot force the hub to hold state.
 
 ## Security Notes
 
@@ -398,3 +498,54 @@ that occur **during** the fan-out iteration:
   for the disconnected client.
 - Pending batch-accumulator timers for the disconnected client are cancelled
   by `onDisconnect`, preventing stale frame delivery.
+
+## Broadcast Authorization & Audit
+
+All WebSocket broadcasts originate from the blockchain indexer service, not from HTTP API endpoints. This section documents the broadcast trigger surface and authorization model.
+
+### Trigger Surface
+
+Broadcasts are triggered exclusively by `src/services/streamEventService.ts` when processing blockchain events:
+
+| Event Type | Function | Broadcast Payload |
+|------------|----------|-------------------|
+| `stream.created` | `processStreamCreated()` | Full stream details (id, parties, amounts, contract metadata) |
+| `stream.updated` | `processStreamUpdated()` | Updated fields (status, amounts, timestamps) |
+| `stream.cancelled` | `processStreamCancelled()` | Stream ID and cancellation status |
+
+### Authorization Model
+
+**No admin authentication is required** for broadcasts because:
+
+1. **Indexer-only origin**: Broadcasts are triggered by the blockchain indexer service ingesting on-chain events, not by HTTP API requests
+2. **No user-controlled path**: There is no HTTP endpoint that allows external users to trigger broadcasts directly
+3. **Chain of trust**: The indexer processes verified blockchain events from the Stellar network, establishing trust at the chain level
+
+The broadcast path:
+```
+Blockchain Event → Indexer Service → StreamEventService.process*() → Hub.broadcast() → WebSocket clients
+```
+
+### Audit Logging
+
+Every broadcast is logged via `recordAuditEvent()` with:
+
+- **Action**: `STREAM_BROADCAST`
+- **Resource**: `stream`
+- **Resource ID**: Stream ID
+- **Metadata**: Event type (`stream.created`, `stream.updated`, `stream.cancelled`) and event ID
+
+This provides a complete audit trail of all broadcasts for compliance and debugging purposes.
+
+### Security Properties
+
+- **No spoofing risk**: Broadcasts cannot be triggered by external HTTP requests
+- **Idempotency**: The indexer deduplicates events before broadcasting
+- **Recipient filtering**: Broadcasts include `recipientAddress` for client-side filtering
+- **Payload validation**: All broadcast payloads are validated before transmission
+
+### Testing
+
+The broadcast authorization model is tested in:
+- `tests/integration/broadcast-auth.test.ts` — Verifies no HTTP endpoint can trigger broadcasts
+- `tests/services/streamEventService.test.ts` — Validates audit logging for all event types

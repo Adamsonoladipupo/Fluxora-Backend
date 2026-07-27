@@ -39,6 +39,11 @@ export function __resetDedupForTest(): void {
 }
 
 export class InMemoryDedupCache implements DedupCache {
+    /** FIFO eviction: when size reaches DEDUP_CACHE_MAX, the oldest-inserted key is evicted.
+     * Under sustained load at capacity, this is a one-in-one-out FIFO.
+     * Trade-off: evicted keys will be treated as new (false negative) if replayed.
+     * This is the fallback for HybridDedupCache when Redis is unavailable;
+     * during a Redis outage, dedup degrades to best-effort on the most recent DEDUP_CACHE_MAX events. */
     private readonly seen = new Map<string, true>();
 
     async has(streamId: string, eventId: string): Promise<boolean> {

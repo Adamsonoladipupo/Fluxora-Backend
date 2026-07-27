@@ -15,7 +15,7 @@ import {
     RedisDedupCache,
     HybridDedupCache,
     __resetDedupForTest,
-    type DedupCache,
+    DEDUP_CACHE_MAX,`n    DEDUP_CACHE_MAX,`n    type DedupCache,
 } from '../../src/redis/dedup.js';
 import type { RedisClient } from '../../src/redis/client.js';
 import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
@@ -316,5 +316,141 @@ describe('DedupCache key format', () => {
             '1',
             expect.any(Object)
         );
+    });
+});
+
+describe('InMemoryDedupCache FIFO eviction', () => {
+    it('evicts the oldest-inserted key when exceeding DEDUP_CACHE_MAX', async () => {
+        const cache = new InMemoryDedupCache();
+        const max = DEDUP_CACHE_MAX;
+
+        for (let i = 0; i < max; i++) {
+            await cache.add('stream', evt- + i);
+        }
+
+        await expect(cache.has('stream', 'evt-0')).resolves.toBe(true);
+
+        const added = await cache.add('stream', evt- + max);
+        expect(added).toBe(true);
+
+        await expect(cache.has('stream', 'evt-0')).resolves.toBe(false);
+        await expect(cache.has('stream', 'evt-1')).resolves.toBe(true);
+        await expect(cache.has('stream', evt- + max)).resolves.toBe(true);
+    });
+
+    it('evicts in strict FIFO order over multiple insertions', async () => {
+        const cache = new InMemoryDedupCache();
+        const max = DEDUP_CACHE_MAX;
+
+        for (let i = 0; i < max; i++) {
+            await cache.add('s', e- + i);
+        }
+
+        for (let i = 0; i < 5; i++) {
+            await cache.add('s', overflow- + i);
+        }
+
+        for (let i = 0; i < 5; i++) {
+            await expect(cache.has('s', e- + i)).resolves.toBe(false);
+        }
+
+        await expect(cache.has('s', 'e-5')).resolves.toBe(true);
+    });
+});
+
+describe('HybridDedupCache Redis-outage replay false-negative', () => {
+    it('treats replayed event as new after cache overflow during Redis outage', async () => {
+        const max = DEDUP_CACHE_MAX;
+        const fallback = new InMemoryDedupCache();
+
+        const brokenPrimary: DedupCache = {
+            has: vi.fn().mockRejectedValue(new Error('Redis down')),
+            add: vi.fn().mockRejectedValue(new Error('Redis down')),
+            clear: vi.fn(),
+            close: vi.fn(),
+        };
+
+        const hybrid = new HybridDedupCache(brokenPrimary, fallback, true);
+
+        for (let i = 0; i < max + 100; i++) {
+            await hybrid.add('stream', evt- + i);
+        }
+
+        await expect(hybrid.has('stream', 'evt-0')).resolves.toBe(false);
+
+        const readded = await hybrid.add('stream', 'evt-0');
+        expect(readded).toBe(true);
+
+        await expect(hybrid.has('stream', evt- + (max + 99))).resolves.toBe(true);
+        const duplicate = await hybrid.add('stream', evt- + (max + 99));
+        expect(duplicate).toBe(false);
+    });
+});
+
+describe('InMemoryDedupCache FIFO eviction', () => {
+    it('evicts the oldest-inserted key when exceeding DEDUP_CACHE_MAX', async () => {
+        const cache = new InMemoryDedupCache();
+        const max = DEDUP_CACHE_MAX;
+
+        for (let i = 0; i < max; i++) {
+            await cache.add('stream', 'evt-' + i);
+        }
+
+        await expect(cache.has('stream', 'evt-0')).resolves.toBe(true);
+
+        const added = await cache.add('stream', 'evt-' + max);
+        expect(added).toBe(true);
+
+        await expect(cache.has('stream', 'evt-0')).resolves.toBe(false);
+        await expect(cache.has('stream', 'evt-1')).resolves.toBe(true);
+        await expect(cache.has('stream', 'evt-' + max)).resolves.toBe(true);
+    });
+
+    it('evicts in strict FIFO order over multiple insertions', async () => {
+        const cache = new InMemoryDedupCache();
+        const max = DEDUP_CACHE_MAX;
+
+        for (let i = 0; i < max; i++) {
+            await cache.add('s', 'e-' + i);
+        }
+
+        for (let i = 0; i < 5; i++) {
+            await cache.add('s', 'overflow-' + i);
+        }
+
+        for (let i = 0; i < 5; i++) {
+            await expect(cache.has('s', 'e-' + i)).resolves.toBe(false);
+        }
+
+        await expect(cache.has('s', 'e-5')).resolves.toBe(true);
+    });
+});
+
+describe('HybridDedupCache Redis-outage replay false-negative', () => {
+    it('treats replayed event as new after cache overflow during Redis outage', async () => {
+        const max = DEDUP_CACHE_MAX;
+        const fallback = new InMemoryDedupCache();
+
+        const brokenPrimary: DedupCache = {
+            has: vi.fn().mockRejectedValue(new Error('Redis down')),
+            add: vi.fn().mockRejectedValue(new Error('Redis down')),
+            clear: vi.fn(),
+            close: vi.fn(),
+        };
+
+        const hybrid = new HybridDedupCache(brokenPrimary, fallback, true);
+
+        for (let i = 0; i < max + 100; i++) {
+            await hybrid.add('stream', 'evt-' + i);
+        }
+
+        await expect(hybrid.has('stream', 'evt-0')).resolves.toBe(false);
+
+        const readded = await hybrid.add('stream', 'evt-0');
+        expect(readded).toBe(true);
+
+        await expect(hybrid.has('stream', 'evt-' + (max + 99))).resolves.toBe(true);
+        const duplicate = await hybrid.add('stream', 'evt-' + (max + 99));
+        expect(duplicate).toBe(false);
     });
 });

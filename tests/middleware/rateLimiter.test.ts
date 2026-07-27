@@ -3,6 +3,7 @@ import type { Request, Response, NextFunction } from 'express';
 import { createRateLimiter, extractClientIdentifier, isAdminKey } from '../../src/middleware/rateLimiter.js';
 import { getClientIp } from '../../src/ws/connectionLimiter.js';
 import { InMemoryStore } from '../../src/redis/rateLimitStore.js';
+import * as overrideService from '../../src/services/tenantRateLimitOverride.service.js';
 
 function mockRequest(props: Partial<Request> = {}): Request & { ip?: string } {
   return {
@@ -349,6 +350,115 @@ describe('rate limiter middleware', () => {
     const result = extractClientIdentifier(req);
     expect(result.identifierType).toBe('ip');
     expect(result.identifier).toBe('unknown');
+  });
+});
+
+describe('rate limiter middleware — per-tenant override resolution', () => {
+  let env: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    env = {
+      RATE_LIMIT_ENABLED: 'true',
+      RATE_LIMIT_IP_MAX: '3',
+      RATE_LIMIT_IP_WINDOW_MS: '60000',
+      RATE_LIMIT_APIKEY_MAX: '5',
+      RATE_LIMIT_APIKEY_WINDOW_MS: '60000',
+    };
+  });
+
+  it('uses override limit when override exists and request is authenticated', async () => {
+    vi.spyOn(overrideService, 'getOverride').mockResolvedValue({
+      id: 'override-1',
+      keyId: 'key-1',
+      maxRequests: 5000,
+      windowMs: 60000,
+      expiresAt: null,
+      createdBy: 'admin:test',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'test-key' } });
+    (req as any).keyId = 'key-1';
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '5000');
+  });
+
+  it('uses global default when no override exists', async () => {
+    vi.spyOn(overrideService, 'getOverride').mockResolvedValue(null);
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'test-key' } });
+    (req as any).keyId = 'key-1';
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '5');
+  });
+
+  it('uses global default when override lookup fails', async () => {
+    vi.spyOn(overrideService, 'getOverride').mockRejectedValue(new Error('DB error'));
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'test-key' } });
+    (req as any).keyId = 'key-1';
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '5');
+  });
+
+  it('does not apply override for unauthenticated requests (no keyId)', async () => {
+    const getOverrideSpy = vi.spyOn(overrideService, 'getOverride');
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'test-key' } });
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '5');
+    expect(getOverrideSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not apply override for admin API keys', async () => {
+    env.ADMIN_API_KEY = 'admin-key';
+    env.RATE_LIMIT_ADMIN_MAX = '20';
+    vi.spyOn(overrideService, 'getOverride').mockResolvedValue({
+      id: 'override-1',
+      keyId: 'admin-key-id',
+      maxRequests: 5000,
+      windowMs: 60000,
+      expiresAt: null,
+      createdBy: 'admin:test',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'admin-key' } });
+    (req as any).keyId = 'admin-key-id';
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '20');
   });
 });
 
