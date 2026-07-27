@@ -10,6 +10,13 @@ const STELLAR_STRKEY_DECODED_LENGTH = 35;
 const STELLAR_STRKEY_PAYLOAD_LENGTH = 33;
 const STELLAR_STRKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
+/**
+ * Maximum allowed message size in bytes (issue #674).
+ * Must match `MAX_MESSAGE_BYTES` in `src/ws/hub.ts` (4096).
+ * Duplicated here to avoid a circular import between hub.ts and messageHandler.ts.
+ */
+export const MAX_MESSAGE_BYTES = 4_096;
+
 // SEP-23 StrKey validation for Stellar Ed25519 public keys: base32 shape,
 // version byte, and CRC16-XModem checksum.
 function decodeStellarBase32(value: string): number[] | null {
@@ -239,6 +246,16 @@ export function validateWebSocketMessage(data: unknown): WsMessageParseResult {
 }
 
 export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
+  // Reject oversized payloads before any parsing (issue #674)
+  const rawString = typeof raw === 'string' ? raw : JSON.stringify(raw);
+  if (rawString && rawString.length > MAX_MESSAGE_BYTES) {
+    return { 
+      ok: false, 
+      code: 'INVALID_MESSAGE', 
+      message: `Message size ${rawString.length} exceeds maximum ${MAX_MESSAGE_BYTES} bytes` 
+    };
+  }
+
   if (!isObject(raw)) {
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a JSON object' };
   }
