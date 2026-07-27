@@ -88,6 +88,15 @@ export const webhookDeliveriesSuppressedTotal =
     registers: [registry],
   });
 
+export const webhookDeliveriesTotal =
+  (registry.getSingleMetric('fluxora_webhook_deliveries_total') as Counter<'outcome'>) ||
+  new Counter({
+    name: 'fluxora_webhook_deliveries_total',
+    help: 'Total number of webhook delivery attempts, labeled by outcome',
+    labelNames: ['outcome'] as const,
+    registers: [registry],
+  });
+
 export const webhookDeliveryDurationSeconds =
   (registry.getSingleMetric('fluxora_webhook_delivery_duration_seconds') as Histogram) ||
   new Histogram({
