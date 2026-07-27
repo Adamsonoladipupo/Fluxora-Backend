@@ -438,7 +438,8 @@ export async function dropOldPartitions(
     if (pBound === 'DEFAULT') continue;
     
     // Bounds typically look like: FOR VALUES FROM ('2023-01-01 00:00:00+00') TO ('2023-02-01 00:00:00+00')
-    const toMatch = pBound.match(/TO \\('([^']+)'\\)/);
+    // Note: literal parentheses in pg_get_expr output — no backslash escaping needed.
+    const toMatch = pBound.match(/TO \('([^']+)'\)/);
     if (toMatch && toMatch[1]) {
       const toDate = new Date(toMatch[1]);
       if (toDate < cutoffDate) {
